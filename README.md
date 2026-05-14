@@ -1,12 +1,11 @@
 # GenKFR
 
 ```bash
-cargo run -- "C:/video/input.mkv"
+genkfr "C:/video/input.mkv"
 ```
 
-
 ```bash
-cargo run -- "C:/video/input.mkv" "C:/video/input.mkv.kf.txt"
+genkfr "C:/video/input.mkv" "C:/video/input.mkv.kf.txt"
 ```
 
 by default:
