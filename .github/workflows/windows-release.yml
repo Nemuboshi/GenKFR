@@ -1,0 +1,233 @@
+name: Windows Release
+
+on:
+  push:
+    tags:
+      - 'v-*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-scxvid:
+    name: Build scxvid.dll
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          update: true
+          install: >-
+            git
+            mingw-w64-clang-x86_64-meson
+            mingw-w64-clang-x86_64-python-build
+            mingw-w64-clang-x86_64-python-wheel
+            mingw-w64-clang-x86_64-toolchain
+            mingw-w64-clang-x86_64-xvidcore
+
+      - name: Clone vapoursynth-scxvid
+        run: |
+          git clone --depth 1 https://github.com/dubhatervapoursynth/vapoursynth-scxvid.git scxvid-src
+
+      - name: Build wheel from latest source
+        run: |
+          cd scxvid-src
+          python -m build -Csetup-args="-Dprefer_static=true" -Csetup-args="-Db_lto=true" -Csetup-args="-Dcpp_link_args=-static"
+
+      - name: Extract scxvid.dll
+        shell: pwsh
+        run: |
+          $wheel = Get-ChildItem scxvid-src/dist/*.whl | Select-Object -First 1
+          if (-not $wheel) { throw 'scxvid wheel not produced' }
+          $zip = Join-Path $env:RUNNER_TEMP 'scxvid.zip'
+          $extract = Join-Path $env:RUNNER_TEMP 'scxvid-wheel'
+          Copy-Item $wheel.FullName $zip -Force
+          if (Test-Path $extract) { Remove-Item $extract -Recurse -Force }
+          Expand-Archive -Path $zip -DestinationPath $extract -Force
+          $dll = Get-ChildItem $extract -Recurse -Filter scxvid.dll | Select-Object -First 1
+          if (-not $dll) { throw 'scxvid.dll not found inside wheel' }
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Copy-Item $dll.FullName out/scxvid.dll -Force
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: scxvid-win-x64
+          path: out/scxvid.dll
+          if-no-files-found: error
+
+  build-vapoursynth:
+    name: Fetch libvapoursynth.dll
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/github-script@v8
+        id: vapoursynth-release
+        with:
+          script: |
+            const releases = await github.paginate('GET /repos/vapoursynth/vapoursynth/releases');
+            const stable = releases.find(r => !r.draft && !r.prerelease);
+            if (!stable) {
+              core.setFailed('No stable VapourSynth release found');
+              return;
+            }
+            const assets = stable.assets.filter(a => a.name.startsWith('VapourSynth64-Portable') && (a.name.endsWith('.7z') || a.name.endsWith('.zip')));
+            if (assets.length !== 1) {
+              core.setFailed(`Expected exactly one VapourSynth64-Portable archive (.7z or .zip) in ${stable.tag_name}, found ${assets.length}`);
+              return;
+            }
+            const asset = assets[0];
+            core.setOutput('tag', stable.tag_name);
+            core.setOutput('asset_name', asset.name);
+            core.setOutput('asset_url', asset.browser_download_url);
+
+      - name: Download and extract libvapoursynth.dll
+        shell: pwsh
+        run: |
+          $sevenZip = (Get-Command 7z -ErrorAction Stop).Source
+          $url = "${{ steps.vapoursynth-release.outputs.asset_url }}"
+          $assetName = "${{ steps.vapoursynth-release.outputs.asset_name }}"
+          $archive = Join-Path $env:RUNNER_TEMP $assetName
+          $extract = Join-Path $env:RUNNER_TEMP 'vapoursynth-portable'
+          $wheelExtract = Join-Path $env:RUNNER_TEMP 'vapoursynth-wheel'
+
+          Invoke-WebRequest -Uri $url -OutFile $archive
+
+          if (Test-Path $extract) { Remove-Item $extract -Recurse -Force }
+          & $sevenZip x $archive "-o$extract" -y | Out-Null
+
+          $wheels = @(Get-ChildItem -Path (Join-Path $extract 'wheel') -Filter *.whl)
+          if ($wheels.Count -ne 1) { throw "Expected exactly one wheel in extracted package, found $($wheels.Count)" }
+
+          if (Test-Path $wheelExtract) { Remove-Item $wheelExtract -Recurse -Force }
+          & $sevenZip x $wheels[0].FullName "-o$wheelExtract" -y | Out-Null
+
+          $dll = Join-Path $wheelExtract 'vapoursynth/libvapoursynth.dll'
+          if (-not (Test-Path $dll)) { throw 'vapoursynth/libvapoursynth.dll not found inside wheel' }
+
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Copy-Item $dll out/libvapoursynth.dll -Force
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: vapoursynth-win-x64
+          path: out/libvapoursynth.dll
+          if-no-files-found: error
+
+  build-ffms2:
+    name: Fetch ffms2.dll
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/github-script@v8
+        id: ffms2-release
+        with:
+          script: |
+            const { data: release } = await github.request('GET /repos/FFMS/ffms2/releases/latest');
+            const assets = release.assets.filter(a => a.name.startsWith('ffms2') && a.name.endsWith('.7z'));
+            if (assets.length !== 1) {
+              core.setFailed(`Expected exactly one ffms2*.7z asset in ${release.tag_name}, found ${assets.length}`);
+              return;
+            }
+            const asset = assets[0];
+            core.setOutput('tag', release.tag_name);
+            core.setOutput('asset_name', asset.name);
+            core.setOutput('asset_url', asset.browser_download_url);
+
+      - name: Download and extract ffms2.dll
+        shell: pwsh
+        run: |
+          $sevenZip = (Get-Command 7z -ErrorAction Stop).Source
+          $url = "${{ steps.ffms2-release.outputs.asset_url }}"
+          $assetName = "${{ steps.ffms2-release.outputs.asset_name }}"
+          $archive = Join-Path $env:RUNNER_TEMP $assetName
+          $extract = Join-Path $env:RUNNER_TEMP 'ffms2-release'
+
+          Invoke-WebRequest -Uri $url -OutFile $archive
+
+          if (Test-Path $extract) { Remove-Item $extract -Recurse -Force }
+          & $sevenZip x $archive "-o$extract" -y | Out-Null
+
+          $dll = Get-ChildItem -Path $extract -Recurse -Filter ffms2.dll |
+            Where-Object { $_.FullName -match '[\\/]x64[\\/]' } |
+            Select-Object -First 1
+          if (-not $dll) { throw 'x64/ffms2.dll not found inside archive' }
+
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Copy-Item $dll.FullName out/ffms2.dll -Force
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ffms2-win-x64
+          path: out/ffms2.dll
+          if-no-files-found: error
+
+  build-app:
+    name: Build local app
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Build genkfr x64
+        shell: pwsh
+        run: |
+          cargo build --release
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Copy-Item target/release/genkfr.exe out/genkfr.exe -Force
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: genkfr-win-x64
+          path: out/genkfr.exe
+          if-no-files-found: error
+
+  package-release:
+    name: Package and publish release
+    runs-on: windows-latest
+    needs:
+      - build-scxvid
+      - build-vapoursynth
+      - build-ffms2
+      - build-app
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Assemble private runtime package
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $pkgRoot = Join-Path $pwd "dist/genkfr-$tag-windows-x64"
+          $runtimeDir = Join-Path $pkgRoot 'runtime'
+          $pluginsDir = Join-Path $runtimeDir 'plugins'
+
+          New-Item -ItemType Directory -Force -Path $pluginsDir | Out-Null
+
+          Copy-Item artifacts/genkfr-win-x64/genkfr.exe $pkgRoot -Force
+          Copy-Item artifacts/vapoursynth-win-x64/libvapoursynth.dll $runtimeDir -Force
+          Copy-Item artifacts/ffms2-win-x64/ffms2.dll $pluginsDir -Force
+          Copy-Item artifacts/scxvid-win-x64/scxvid.dll $pluginsDir -Force
+          Copy-Item README.md $pkgRoot -Force
+
+          $zipPath = Join-Path $pwd "dist/genkfr-$tag-windows-x64.zip"
+          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+          Compress-Archive -Path $pkgRoot -DestinationPath $zipPath -Force
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*.zip
