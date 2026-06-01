@@ -5,10 +5,10 @@ genkfr "C:/video/input.mkv"
 ```
 
 ```bash
-genkfr "C:/video/input.mkv" "C:/video/input.mkv.kf.txt"
+genkfr "C:/video/input1.mkv" "C:/video/input2.mkv" "C:/video/input3.mkv"
 ```
 
-by default:
+outputs:
 
 ```txt
 <input>.kf.txt

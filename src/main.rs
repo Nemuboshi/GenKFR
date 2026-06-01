@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use libloading::{Library, Symbol};
 use std::env;
 use std::ffi::{CStr, CString};
@@ -82,13 +82,8 @@ struct VSCoreInfo {
 
 type VSMessageHandler = unsafe extern "system" fn(c_int, *const c_char, *mut c_void);
 type VSMessageHandlerFree = unsafe extern "system" fn(*mut c_void);
-type VSFrameDoneCallback = unsafe extern "system" fn(
-    *mut c_void,
-    *const VSFrameRef,
-    c_int,
-    *mut VSNodeRef,
-    *const c_char,
-);
+type VSFrameDoneCallback =
+    unsafe extern "system" fn(*mut c_void, *const VSFrameRef, c_int, *mut VSNodeRef, *const c_char);
 
 type VSGetVapourSynthAPI = unsafe extern "system" fn(c_int) -> *const VSAPI;
 
@@ -106,8 +101,13 @@ struct VSAPI {
     free_node: unsafe extern "system" fn(*mut VSNodeRef),
     free_func: unsafe extern "system" fn(*mut VSFuncRef),
 
-    new_video_frame:
-        unsafe extern "system" fn(*const VSFormat, c_int, c_int, *const VSFrameRef, *mut VSCore) -> *mut VSFrameRef,
+    new_video_frame: unsafe extern "system" fn(
+        *const VSFormat,
+        c_int,
+        c_int,
+        *const VSFrameRef,
+        *mut VSCore,
+    ) -> *mut VSFrameRef,
     copy_frame: unsafe extern "system" fn(*const VSFrameRef, *mut VSCore) -> *mut VSFrameRef,
     copy_frame_props: unsafe extern "system" fn(*const VSFrameRef, *mut VSFrameRef, *mut VSCore),
 
@@ -126,8 +126,23 @@ struct VSAPI {
         *const VSMap,
         *mut VSMap,
         *const c_char,
-        unsafe extern "system" fn(*mut VSMap, *mut VSMap, *mut *mut c_void, *mut VSNode, *mut VSCore, *const VSAPI),
-        unsafe extern "system" fn(c_int, c_int, *mut *mut c_void, *mut *mut c_void, *mut VSFrameContext, *mut VSCore, *const VSAPI) -> *const VSFrameRef,
+        unsafe extern "system" fn(
+            *mut VSMap,
+            *mut VSMap,
+            *mut *mut c_void,
+            *mut VSNode,
+            *mut VSCore,
+            *const VSAPI,
+        ),
+        unsafe extern "system" fn(
+            c_int,
+            c_int,
+            *mut *mut c_void,
+            *mut *mut c_void,
+            *mut VSFrameContext,
+            *mut VSCore,
+            *const VSAPI,
+        ) -> *const VSFrameRef,
         unsafe extern "system" fn(*mut c_void, *mut VSCore, *const VSAPI),
         c_int,
         c_int,
@@ -140,13 +155,24 @@ struct VSAPI {
     invoke: unsafe extern "system" fn(*mut VSPlugin, *const c_char, *const VSMap) -> *mut VSMap,
 
     get_format_preset: unsafe extern "system" fn(c_int, *mut VSCore) -> *const VSFormat,
-    register_format: unsafe extern "system" fn(c_int, c_int, c_int, c_int, c_int, *mut VSCore) -> *const VSFormat,
+    register_format: unsafe extern "system" fn(
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        *mut VSCore,
+    ) -> *const VSFormat,
 
-    get_frame: unsafe extern "system" fn(c_int, *mut VSNodeRef, *mut c_char, c_int) -> *const VSFrameRef,
-    get_frame_async: unsafe extern "system" fn(c_int, *mut VSNodeRef, VSFrameDoneCallback, *mut c_void),
-    get_frame_filter: unsafe extern "system" fn(c_int, *mut VSNodeRef, *mut VSFrameContext) -> *const VSFrameRef,
+    get_frame:
+        unsafe extern "system" fn(c_int, *mut VSNodeRef, *mut c_char, c_int) -> *const VSFrameRef,
+    get_frame_async:
+        unsafe extern "system" fn(c_int, *mut VSNodeRef, VSFrameDoneCallback, *mut c_void),
+    get_frame_filter:
+        unsafe extern "system" fn(c_int, *mut VSNodeRef, *mut VSFrameContext) -> *const VSFrameRef,
     request_frame_filter: unsafe extern "system" fn(c_int, *mut VSNodeRef, *mut VSFrameContext),
-    query_completed_frame: unsafe extern "system" fn(*mut *mut VSNodeRef, *mut c_int, *mut VSFrameContext),
+    query_completed_frame:
+        unsafe extern "system" fn(*mut *mut VSNodeRef, *mut c_int, *mut VSFrameContext),
     release_frame_early: unsafe extern "system" fn(*mut VSNodeRef, c_int, *mut VSFrameContext),
 
     get_stride: unsafe extern "system" fn(*const VSFrameRef, c_int) -> c_int,
@@ -160,7 +186,13 @@ struct VSAPI {
         *mut VSCore,
         *const VSAPI,
     ) -> *mut VSFuncRef,
-    call_func: unsafe extern "system" fn(*mut VSFuncRef, *const VSMap, *mut VSMap, *mut VSCore, *const VSAPI),
+    call_func: unsafe extern "system" fn(
+        *mut VSFuncRef,
+        *const VSMap,
+        *mut VSMap,
+        *mut VSCore,
+        *const VSAPI,
+    ),
 
     create_map: unsafe extern "system" fn() -> *mut VSMap,
     free_map: unsafe extern "system" fn(*mut VSMap),
@@ -180,20 +212,34 @@ struct VSAPI {
     prop_get_type: unsafe extern "system" fn(*const VSMap, *const c_char) -> c_char,
 
     prop_get_int: unsafe extern "system" fn(*const VSMap, *const c_char, c_int, *mut c_int) -> i64,
-    prop_get_float: unsafe extern "system" fn(*const VSMap, *const c_char, c_int, *mut c_int) -> f64,
-    prop_get_data: unsafe extern "system" fn(*const VSMap, *const c_char, c_int, *mut c_int) -> *const c_char,
-    prop_get_data_size: unsafe extern "system" fn(*const VSMap, *const c_char, c_int, *mut c_int) -> c_int,
-    prop_get_node: unsafe extern "system" fn(*const VSMap, *const c_char, c_int, *mut c_int) -> *mut VSNodeRef,
-    prop_get_frame: unsafe extern "system" fn(*const VSMap, *const c_char, c_int, *mut c_int) -> *const VSFrameRef,
-    prop_get_func: unsafe extern "system" fn(*const VSMap, *const c_char, c_int, *mut c_int) -> *mut VSFuncRef,
+    prop_get_float:
+        unsafe extern "system" fn(*const VSMap, *const c_char, c_int, *mut c_int) -> f64,
+    prop_get_data:
+        unsafe extern "system" fn(*const VSMap, *const c_char, c_int, *mut c_int) -> *const c_char,
+    prop_get_data_size:
+        unsafe extern "system" fn(*const VSMap, *const c_char, c_int, *mut c_int) -> c_int,
+    prop_get_node:
+        unsafe extern "system" fn(*const VSMap, *const c_char, c_int, *mut c_int) -> *mut VSNodeRef,
+    prop_get_frame: unsafe extern "system" fn(
+        *const VSMap,
+        *const c_char,
+        c_int,
+        *mut c_int,
+    ) -> *const VSFrameRef,
+    prop_get_func:
+        unsafe extern "system" fn(*const VSMap, *const c_char, c_int, *mut c_int) -> *mut VSFuncRef,
 
     prop_delete_key: unsafe extern "system" fn(*mut VSMap, *const c_char) -> c_int,
     prop_set_int: unsafe extern "system" fn(*mut VSMap, *const c_char, i64, c_int) -> c_int,
     prop_set_float: unsafe extern "system" fn(*mut VSMap, *const c_char, f64, c_int) -> c_int,
-    prop_set_data: unsafe extern "system" fn(*mut VSMap, *const c_char, *const c_char, c_int, c_int) -> c_int,
-    prop_set_node: unsafe extern "system" fn(*mut VSMap, *const c_char, *mut VSNodeRef, c_int) -> c_int,
-    prop_set_frame: unsafe extern "system" fn(*mut VSMap, *const c_char, *const VSFrameRef, c_int) -> c_int,
-    prop_set_func: unsafe extern "system" fn(*mut VSMap, *const c_char, *mut VSFuncRef, c_int) -> c_int,
+    prop_set_data:
+        unsafe extern "system" fn(*mut VSMap, *const c_char, *const c_char, c_int, c_int) -> c_int,
+    prop_set_node:
+        unsafe extern "system" fn(*mut VSMap, *const c_char, *mut VSNodeRef, c_int) -> c_int,
+    prop_set_frame:
+        unsafe extern "system" fn(*mut VSMap, *const c_char, *const VSFrameRef, c_int) -> c_int,
+    prop_set_func:
+        unsafe extern "system" fn(*mut VSMap, *const c_char, *mut VSFuncRef, c_int) -> c_int,
 
     set_max_cache_size: unsafe extern "system" fn(i64, *mut VSCore) -> i64,
     get_output_index: unsafe extern "system" fn(*mut VSFrameContext) -> c_int,
@@ -211,15 +257,20 @@ struct VSAPI {
 
     get_plugin_path: unsafe extern "system" fn(*const VSPlugin) -> *const c_char,
 
-    prop_get_int_array: unsafe extern "system" fn(*const VSMap, *const c_char, *mut c_int) -> *const i64,
-    prop_get_float_array: unsafe extern "system" fn(*const VSMap, *const c_char, *mut c_int) -> *const f64,
+    prop_get_int_array:
+        unsafe extern "system" fn(*const VSMap, *const c_char, *mut c_int) -> *const i64,
+    prop_get_float_array:
+        unsafe extern "system" fn(*const VSMap, *const c_char, *mut c_int) -> *const f64,
 
-    prop_set_int_array: unsafe extern "system" fn(*mut VSMap, *const c_char, *const i64, c_int) -> c_int,
-    prop_set_float_array: unsafe extern "system" fn(*mut VSMap, *const c_char, *const f64, c_int) -> c_int,
+    prop_set_int_array:
+        unsafe extern "system" fn(*mut VSMap, *const c_char, *const i64, c_int) -> c_int,
+    prop_set_float_array:
+        unsafe extern "system" fn(*mut VSMap, *const c_char, *const f64, c_int) -> c_int,
 
     log_message: unsafe extern "system" fn(c_int, *const c_char),
 
-    add_message_handler: unsafe extern "system" fn(VSMessageHandler, VSMessageHandlerFree, *mut c_void) -> c_int,
+    add_message_handler:
+        unsafe extern "system" fn(VSMessageHandler, VSMessageHandlerFree, *mut c_void) -> c_int,
     remove_message_handler: unsafe extern "system" fn(c_int) -> c_int,
     get_core_info2: unsafe extern "system" fn(*mut VSCore, *mut VSCoreInfo),
 }
@@ -247,7 +298,8 @@ struct OwnedNode<'a> {
 impl VapourSynth {
     fn load(path: &Path) -> Result<Self> {
         unsafe {
-            let lib = Library::new(path).with_context(|| format!("failed to load {}", path.display()))?;
+            let lib =
+                Library::new(path).with_context(|| format!("failed to load {}", path.display()))?;
             let get_api: Symbol<VSGetVapourSynthAPI> = lib
                 .get(b"getVapourSynthAPI\0")
                 .context("failed to load getVapourSynthAPI symbol")?;
@@ -255,7 +307,10 @@ impl VapourSynth {
             if api.is_null() {
                 bail!("getVapourSynthAPI returned null for API version {VAPOURSYNTH_API_VERSION}");
             }
-            Ok(Self { _lib: lib, api: &*api })
+            Ok(Self {
+                _lib: lib,
+                api: &*api,
+            })
         }
     }
 }
@@ -286,14 +341,22 @@ impl<'a> Core<'a> {
         Ok(!plugin.is_null())
     }
 
-    fn invoke_node(&self, plugin_ns: &str, function: &str, args: &OwnedMap<'a>) -> Result<OwnedNode<'a>> {
+    fn invoke_node(
+        &self,
+        plugin_ns: &str,
+        function: &str,
+        args: &OwnedMap<'a>,
+    ) -> Result<OwnedNode<'a>> {
         let plugin = self.get_plugin_by_ns(plugin_ns)?;
         let function_c = CString::new(function)?;
         let result = unsafe { (self.api.invoke)(plugin, function_c.as_ptr(), args.raw) };
         if result.is_null() {
             bail!("invoke returned null for {plugin_ns}.{function}");
         }
-        let result_map = OwnedMap { api: self.api, raw: result };
+        let result_map = OwnedMap {
+            api: self.api,
+            raw: result,
+        };
         result_map.check_error(&format!("{plugin_ns}.{function}"))?;
         result_map.get_node("clip")
     }
@@ -311,11 +374,17 @@ impl<'a> Core<'a> {
         if result.is_null() {
             bail!("std.LoadPlugin returned null for {}", plugin_path.display());
         }
-        let result_map = OwnedMap { api: self.api, raw: result };
+        let result_map = OwnedMap {
+            api: self.api,
+            raw: result,
+        };
         result_map.check_error(&format!("std.LoadPlugin({})", plugin_path.display()))?;
 
         if !self.has_plugin(namespace)? {
-            bail!("plugin {namespace} still unavailable after loading {}", plugin_path.display());
+            bail!(
+                "plugin {namespace} still unavailable after loading {}",
+                plugin_path.display()
+            );
         }
         Ok(())
     }
@@ -326,7 +395,12 @@ impl<'a> Core<'a> {
         self.invoke_node("ffms2", "Source", &args)
     }
 
-    fn resize_to_scxvid(&self, node: &OwnedNode<'a>, width: i32, height: i32) -> Result<OwnedNode<'a>> {
+    fn resize_to_scxvid(
+        &self,
+        node: &OwnedNode<'a>,
+        width: i32,
+        height: i32,
+    ) -> Result<OwnedNode<'a>> {
         let args = OwnedMap::new(self.api);
         args.set_node("clip", node.raw)?;
         args.set_int("width", width as i64)?;
@@ -363,7 +437,10 @@ impl<'a> OwnedMap<'a> {
             if err.is_null() {
                 Ok(())
             } else {
-                Err(anyhow!("{context}: {}", CStr::from_ptr(err).to_string_lossy()))
+                Err(anyhow!(
+                    "{context}: {}",
+                    CStr::from_ptr(err).to_string_lossy()
+                ))
             }
         }
     }
@@ -432,15 +509,10 @@ impl<'a> Drop for OwnedNode<'a> {
 }
 
 fn main() -> Result<()> {
-    let mut args = env::args_os().skip(1);
-    let input = args
-        .next()
-        .map(PathBuf::from)
-        .context("usage: genkfr <input-video> [output-kf.txt]")?;
-    let output = args
-        .next()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(format!("{}.kf.txt", input.display())));
+    let inputs: Vec<PathBuf> = env::args_os().skip(1).map(PathBuf::from).collect();
+    if inputs.is_empty() {
+        bail!("usage: genkfr <input-video> [input-video ...]");
+    }
 
     let runtime = RuntimeLayout::discover()?;
     let vs = VapourSynth::load(&runtime.vapoursynth_dll)?;
@@ -449,24 +521,40 @@ fn main() -> Result<()> {
     core.load_plugin("ffms2", &runtime.ffms2_dll)?;
     core.load_plugin("scxvid", &runtime.scxvid_dll)?;
 
-    let input = canonicalize_lossy(&input)?;
+    println!("runtime: {}", runtime.root.display());
+
+    for input in inputs {
+        process_input(vs.api, &core, &input)
+            .with_context(|| format!("failed to process {}", input.display()))?;
+    }
+
+    Ok(())
+}
+
+fn process_input<'a>(api: &'a VSAPI, core: &Core<'a>, input: &Path) -> Result<()> {
+    let output = default_output_path(input);
+    let input = canonicalize_lossy(input)?;
     let source = core.source(&input)?;
-    let info = video_info(vs.api, source.raw)?;
+    let info = video_info(api, source.raw)?;
     let target_width = align_width_4(info.width, info.height, TARGET_HEIGHT);
     let resized = core.resize_to_scxvid(&source, target_width, TARGET_HEIGHT)?;
     let analyzed = core.scxvid(&resized, SCENE_PROP)?;
 
-    let keyframes = collect_keyframes(vs.api, analyzed.raw, info.num_frames)?;
+    let keyframes = collect_keyframes(api, analyzed.raw, info.num_frames)?;
     write_kf_file(&output, info.fps(), &keyframes)?;
 
     println!("input: {}", input.display());
     println!("output: {}", output.display());
-    println!("runtime: {}", runtime.root.display());
     println!("frames: {}", info.num_frames);
     println!("fps: {:.6}", info.fps());
     println!("keyframes: {}", keyframes.len());
+    println!();
 
     Ok(())
+}
+
+fn default_output_path(input: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.kf.txt", input.display()))
 }
 
 fn collect_keyframes(api: &VSAPI, node: *mut VSNodeRef, num_frames: i32) -> Result<Vec<i32>> {
@@ -478,9 +566,12 @@ fn collect_keyframes(api: &VSAPI, node: *mut VSNodeRef, num_frames: i32) -> Resu
         if n % 1000 == 0 {
             eprintln!("processing frame {n}/{num_frames}");
         }
-        let frame = unsafe { (api.get_frame)(n, node, error_buf.as_mut_ptr(), error_buf.len() as c_int) };
+        let frame =
+            unsafe { (api.get_frame)(n, node, error_buf.as_mut_ptr(), error_buf.len() as c_int) };
         if frame.is_null() {
-            let msg = unsafe { CStr::from_ptr(error_buf.as_ptr()) }.to_string_lossy().into_owned();
+            let msg = unsafe { CStr::from_ptr(error_buf.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
             bail!("getFrame({n}) failed: {msg}");
         }
 
@@ -499,9 +590,11 @@ fn collect_keyframes(api: &VSAPI, node: *mut VSNodeRef, num_frames: i32) -> Resu
 
 fn write_kf_file(path: &Path, fps: f64, keyframes: &[i32]) -> Result<()> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    let mut file = fs::File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+    let mut file =
+        fs::File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
     writeln!(file, "# keyframe format v1")?;
     writeln!(file, "fps {:.6}", fps)?;
     for frame in keyframes {
