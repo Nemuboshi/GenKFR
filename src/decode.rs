@@ -84,7 +84,7 @@ struct FfmsIndexer {
     _private: [u8; 0],
 }
 
-#[link(name = "ffms2")]
+#[link(name = "ffms2", kind = "static")]
 unsafe extern "C" {
     fn FFMS_Init(argument_count: c_int, argument_values: c_int);
     fn FFMS_GetPixFmt(name: *const c_char) -> c_int;
