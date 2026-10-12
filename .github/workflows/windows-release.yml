@@ -26,10 +26,13 @@ env:
   XVIDCORE_VERSION: '1.3.7'
   NASM_VERSION: '2.16.03'
   # vcpkg is preinstalled at C:\vcpkg on the GitHub Windows runners.
-  # The cache key for FFmpeg. Bump this by hand when the feature list below
-  # changes. It must NOT hash this file, or every edit loses the 20-minute
-  # FFmpeg build.
-  VCPKG_CACHE_KEY: 'ffmpeg-9-avcodec-avformat-swscale-swresample-zlib-static-md'
+  #
+  # The vcpkg binary cache stores one zip per installed package, not the whole
+  # installed tree. That is much smaller, and vcpkg writes it as it goes, so a
+  # 20-minute FFmpeg build is not repeated.
+  VCPKG_BINARY_SOURCES: 'files,C:\vcpkg-cache,readwrite'
+  # Fixed, so that editing this workflow does not throw the cache away.
+  VCPKG_CACHE_VERSION: 'v1'
 
 jobs:
   build:
@@ -43,24 +46,24 @@ jobs:
         with:
           toolchain: stable
 
-      # FFmpeg takes about 20 minutes to build. Restore and save are separate
-      # steps so that the cache is written even when a later step fails.
-      #
-      # The restore-key prefix also matches the older key format
-      # (vcpkg-static-md-Windows-...), so a cache from an earlier run is reused.
-      - name: Restore the vcpkg cache
+      # Only the per-package zips, not the multi-gigabyte installed tree.
+      # Restore and save are separate so the cache is written even when a
+      # later step fails.
+      - name: Restore the vcpkg binary cache
         id: vcpkg-cache
         uses: actions/cache/restore@v4
         with:
-          path: C:\vcpkg\installed
-          key: vcpkg-${{ env.VCPKG_CACHE_KEY }}-${{ runner.os }}
+          path: C:\vcpkg-cache
+          key: vcpkg-bincache-${{ env.VCPKG_CACHE_VERSION }}-${{ runner.os }}
           restore-keys: |
-            vcpkg-static-md-${{ runner.os }}-
-            vcpkg-
+            vcpkg-bincache-${{ runner.os }}-
 
       - name: Install static FFmpeg
         shell: pwsh
         run: |
+          if (-not (Test-Path 'C:\vcpkg\vcpkg.exe')) { throw 'vcpkg is not at C:\vcpkg' }
+          New-Item -ItemType Directory -Force -Path 'C:\vcpkg-cache' | Out-Null
+
           # The -md triplet links the C runtime dynamically, which is what
           # Rust uses. The plain x64-windows-static triplet uses a static CRT
           # and fails to link against a Rust binary.
@@ -70,16 +73,18 @@ jobs:
           # avfilter are left out. zlib compresses the FFMS2 index
           # (src/core/zipfile.cpp).
           C:\vcpkg\vcpkg.exe install "ffmpeg[avcodec,avformat,swscale,swresample,zlib]:x64-windows-static-md"
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg install failed' }
           C:\vcpkg\vcpkg.exe integrate install
 
       # Save as soon as FFmpeg exists, so a later failure still caches it.
-      - name: Save the vcpkg cache
+      - name: Save the vcpkg binary cache
         if: always() && steps.vcpkg-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
-          path: C:\vcpkg\installed
-          key: vcpkg-${{ env.VCPKG_CACHE_KEY }}-${{ runner.os }}
+          path: C:\vcpkg-cache
+          key: vcpkg-bincache-${{ env.VCPKG_CACHE_VERSION }}-${{ runner.os }}
 
+      # Save as soon as FFmpeg exists, so a later failure still caches it.
       # The runner does not put MSVC on PATH. Import the environment that
       # vcvars64.bat sets, once, for every later step.
       - name: Set up the MSVC environment
