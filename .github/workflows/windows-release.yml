@@ -2,14 +2,13 @@ name: Windows Release
 
 # Builds a single genkfr.exe with no DLL files beside it.
 #
-# FFmpeg comes from vcpkg as static libraries. Everything else is built from
-# source in this workflow:
-#   - FFMS2, from the sources vendored in vendor/ffms2. build.rs compiles them.
-#   - xvidcore, from its own repository.
+# FFmpeg comes from the `FFmpeg Static Libraries` workflow, which publishes the
+# static libraries as a release asset. That workflow builds them once per
+# version and reuses the asset after that, so this workflow does not build
+# FFmpeg and needs no vcpkg.
 #
-# FFMS2 is normally built as a DLL, and its repository also builds AviSynth and
-# VapourSynth plugins. GenKFR uses neither, so the core sources are vendored and
-# compiled by cargo.
+# xvidcore is built from its own repository. FFMS2 is a submodule, compiled by
+# build.rs.
 
 on:
   push:
@@ -21,26 +20,27 @@ permissions:
   contents: write
 
 env:
-  # Pinned so the build does not change under us.
+  # The FFmpeg version to link. Must match a release published by
+  # ffmpeg-libs.yml, or that workflow will build it first.
+  FFMPEG_VERSION: '9.0.2'
   XVIDCORE_VERSION: '1.3.7'
   NASM_VERSION: '2.16.03'
-  # vcpkg is preinstalled at C:\vcpkg on the GitHub Windows runners.
-  #
-  # The vcpkg binary cache stores one zip per installed package, not the whole
-  # installed tree. That is much smaller, and vcpkg writes it as it goes, so the
-  # FFmpeg build is not repeated.
-  VCPKG_BINARY_SOURCES: 'files,C:\vcpkg-cache,readwrite'
-  # A release-only triplet. vcpkg builds debug and release by default, which
-  # doubles the FFmpeg build time for libraries that are never linked.
-  VCPKG_OVERLAY_TRIPLETS: '${{ github.workspace }}\.github\triplets'
-  TRIPLET: 'x64-windows-static-md-release'
-  # Fixed, so that editing this workflow does not throw the cache away.
-  VCPKG_CACHE_VERSION: 'v1'
 
 jobs:
+  # Build the FFmpeg libraries, or reuse the release if it already exists.
+  ffmpeg:
+    name: FFmpeg libraries
+    uses: ./.github/workflows/ffmpeg-libs.yml
+    permissions:
+      contents: write
+    with:
+      # Keep this in step with FFMPEG_VERSION above.
+      version: '9.0.2'
+
   build:
     name: Build genkfr
     runs-on: windows-latest
+    needs: ffmpeg
 
     steps:
       # The FFMS2 submodule holds the sources that build.rs compiles.
@@ -52,41 +52,25 @@ jobs:
         with:
           toolchain: stable
 
-      # Only the per-package zips, not the multi-gigabyte installed tree.
-      # Restore and save are separate so the cache is written even when a later
-      # step fails.
-      - name: Restore the vcpkg binary cache
-        id: vcpkg-cache
-        uses: actions/cache/restore@v4
-        with:
-          path: C:\vcpkg-cache
-          key: vcpkg-bincache-${{ env.VCPKG_CACHE_VERSION }}-${{ runner.os }}
-          restore-keys: |
-            vcpkg-bincache-${{ runner.os }}-
-
-      - name: Install static FFmpeg
+      - name: Download the FFmpeg libraries
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if (-not (Test-Path 'C:\vcpkg\vcpkg.exe')) { throw 'vcpkg is not at C:\vcpkg' }
-          New-Item -ItemType Directory -Force -Path 'C:\vcpkg-cache' | Out-Null
+          $tag = "${{ needs.ffmpeg.outputs.tag }}"
+          $dir = Join-Path $env:RUNNER_TEMP 'ffmpeg'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          & gh release download $tag --pattern '*.zip' --dir $dir
+          if ($LASTEXITCODE -ne 0) { throw "cannot download the assets of $tag" }
 
-          # The -md triplet links the C runtime dynamically, which is what Rust
-          # uses. A static CRT fails to link against a Rust binary.
-          #
-          # avcodec, avformat and swscale are what FFMS2 and GenKFR use. avutil
-          # is always built and has no feature of its own. avdevice and avfilter
-          # are left out. zlib compresses the FFMS2 index (zipfile.cpp).
-          C:\vcpkg\vcpkg.exe install "ffmpeg[avcodec,avformat,swscale,swresample,zlib]:$env:TRIPLET"
-          if ($LASTEXITCODE -ne 0) { throw 'vcpkg install failed' }
-          C:\vcpkg\vcpkg.exe integrate install
+          $zip = Get-ChildItem $dir -Filter *.zip | Select-Object -First 1
+          if (-not $zip) { throw "no archive in $tag" }
+          Expand-Archive -Path $zip.FullName -DestinationPath $dir -Force
 
-      # Save as soon as FFmpeg exists, so a later failure still caches it.
-      - name: Save the vcpkg binary cache
-        if: always() && steps.vcpkg-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: C:\vcpkg-cache
-          key: vcpkg-bincache-${{ env.VCPKG_CACHE_VERSION }}-${{ runner.os }}
+          if (-not (Test-Path "$dir\include")) { throw 'the archive has no include directory' }
+          if (-not (Test-Path "$dir\lib")) { throw 'the archive has no lib directory' }
+          Write-Output "FFmpeg libraries from $tag"
+          if (Test-Path "$dir\PACKAGES.txt") { Get-Content "$dir\PACKAGES.txt" }
 
       # The runner does not put MSVC on PATH. Import the environment that
       # vcvars64.bat sets, once, for every later step.
@@ -209,9 +193,9 @@ jobs:
       - name: Build genkfr
         shell: pwsh
         run: |
-          # build.rs compiles the vendored FFMS2 core and finds FFmpeg through
+          # build.rs compiles the FFMS2 submodule and finds FFmpeg through
           # FFMPEG_DIR. xvidcore is found through RUSTFLAGS.
-          $env:FFMPEG_DIR = "C:\vcpkg\installed\$env:TRIPLET"
+          $env:FFMPEG_DIR = Join-Path $env:RUNNER_TEMP 'ffmpeg'
           $env:RUSTFLAGS = "-L native=$env:RUNNER_TEMP"
 
           cargo build --release
