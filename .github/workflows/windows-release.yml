@@ -3,7 +3,7 @@ name: Windows Release
 # Builds a single genkfr.exe with no DLL files beside it.
 #
 # The dependencies are built from source and linked statically:
-#   - FFmpeg, from vcpkg (x64-windows-static-md)
+#   - FFmpeg, from vcpkg (x64-windows-static-md, release only)
 #   - FFMS2, compiled here from its own sources against that FFmpeg
 #   - xvidcore, compiled here from its own sources
 #
@@ -31,6 +31,10 @@ env:
   # installed tree. That is much smaller, and vcpkg writes it as it goes, so a
   # 20-minute FFmpeg build is not repeated.
   VCPKG_BINARY_SOURCES: 'files,C:\vcpkg-cache,readwrite'
+  # A release-only triplet. vcpkg builds debug and release by default, which
+  # doubles the FFmpeg build time for libraries that are never linked.
+  VCPKG_OVERLAY_TRIPLETS: '${{ github.workspace }}\.github\triplets'
+  TRIPLET: 'x64-windows-static-md-release'
   # Fixed, so that editing this workflow does not throw the cache away.
   VCPKG_CACHE_VERSION: 'v1'
 
@@ -72,7 +76,7 @@ jobs:
           # avutil is always built and has no feature of its own. avdevice and
           # avfilter are left out. zlib compresses the FFMS2 index
           # (src/core/zipfile.cpp).
-          C:\vcpkg\vcpkg.exe install "ffmpeg[avcodec,avformat,swscale,swresample,zlib]:x64-windows-static-md"
+          C:\vcpkg\vcpkg.exe install "ffmpeg[avcodec,avformat,swscale,swresample,zlib]:${{ env.TRIPLET }}"
           if ($LASTEXITCODE -ne 0) { throw 'vcpkg install failed' }
           C:\vcpkg\vcpkg.exe integrate install
 
@@ -213,12 +217,16 @@ jobs:
 
           # GenKFR needs the core only. The vcxproj in the repository also
           # builds the AviSynth and VapourSynth plugins, which are not used.
-          $inc = 'C:\vcpkg\installed\x64-windows-static-md\include'
+          $inc = "C:\vcpkg\installed\$env:TRIPLET\include"
           $obj = Join-Path $env:RUNNER_TEMP 'ffms-obj'
           New-Item -ItemType Directory -Force -Path $obj | Out-Null
 
+          # FFMS_STATIC turns FFMS_API into a plain declaration instead of
+          # __declspec(dllimport). Without it, defining the API functions is an
+          # error (C2491).
           $defs = @('/nologo','/c','/O2','/EHsc','/std:c++17','/DNDEBUG',
-                    '/D_CRT_SECURE_NO_WARNINGS',"/I$root\include","/I$inc")
+                    '/D_CRT_SECURE_NO_WARNINGS','/DFFMS_STATIC',
+                    "/I$root\include","/I$inc")
 
           Push-Location $root
           try {
@@ -237,7 +245,7 @@ jobs:
       - name: Build genkfr
         shell: pwsh
         run: |
-          $vcpkg = 'C:\vcpkg\installed\x64-windows-static-md\lib'
+          $vcpkg = "C:\vcpkg\installed\$env:TRIPLET\lib"
           $flags = @("-L native=$env:RUNNER_TEMP", "-L native=$vcpkg")
           # FFMS2 needs FFmpeg, and FFmpeg needs these system libraries.
           $system = @('bcrypt','ws2_32','secur32','mfplat','mfuuid','strmiids',
