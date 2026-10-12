@@ -32,19 +32,27 @@ the size of the output.
 
 ## Build
 
-`genkfr.exe` links everything statically, so the release has no DLL files. The
-build needs three libraries:
+`genkfr.exe` links everything statically, so the release has no DLL files.
 
-- `ffms2.lib`, built from FFMS2's `src/core` sources
-- `xvidcore.lib`, built from xvidcore's sources
-- FFmpeg's static libraries, which FFMS2 needs
-
-The workflow in `.github/workflows/windows-release.yml` builds all three from
-source. To build by hand, put the three `.lib` files in one directory and point
-`rustflags` at it:
+FFMS2 is a git submodule in `vendor/ffms2`, pinned to a commit. `build.rs`
+compiles its core sources, because FFMS2 is normally built as a DLL and GenKFR
+links it statically. Clone with submodules:
 
 ```bash
-RUSTFLAGS="-L native=/path/to/libs" cargo build --release
+git clone --recursive <repository>
 ```
 
-FFMS2 also needs the system libraries listed in the workflow's build step.
+Two things must be available:
+
+- **FFmpeg**, for its headers and static libraries. Set `FFMPEG_DIR` to the
+  prefix that holds `include/` and `lib/`. `build.rs` also looks in a vcpkg
+  tree when `VCPKG_ROOT` is set.
+- **xvidcore.lib**, from xvidcore's sources. Put it on the library path with
+  `RUSTFLAGS`.
+
+```bash
+FFMPEG_DIR=/path/to/ffmpeg RUSTFLAGS="-L native=/path/to/xvidcore" cargo build --release
+```
+
+The workflow in `.github/workflows/windows-release.yml` builds both from
+source. See it for the exact flags.

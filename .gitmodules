@@ -1,0 +1,3 @@
+[submodule "vendor/ffms2"]
+	path = vendor/ffms2
+	url = https://github.com/FFMS/ffms2.git

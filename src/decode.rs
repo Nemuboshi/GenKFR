@@ -13,8 +13,6 @@ use std::path::Path;
 
 // FFMS_TYPE_UNKNOWN is -1, so video is 0. See ffms.h:156.
 const FFMS_TYPE_VIDEO: c_int = 0;
-/// Sequential access without rewind. GenKFR reads every frame once, in order.
-const FFMS_SEEK_LINEAR_NO_RW: c_int = -1;
 const FFMS_SEEK_NORMAL: c_int = 1;
 
 /// GenKFR reads every frame once, in order, so linear access is enough.
@@ -84,7 +82,6 @@ struct FfmsIndexer {
     _private: [u8; 0],
 }
 
-#[link(name = "ffms2", kind = "static")]
 unsafe extern "C" {
     fn FFMS_Init(argument_count: c_int, argument_values: c_int);
     fn FFMS_GetPixFmt(name: *const c_char) -> c_int;

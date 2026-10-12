@@ -152,7 +152,7 @@ struct XvidEncStats {
     sse_v: c_int,
 }
 
-// Linked statically: GenKFR builds xvidcore from source, so no DLL is needed.
+// xvidcore is built by the workflow and linked statically, so no DLL is needed.
 #[link(name = "xvidcore", kind = "static")]
 unsafe extern "C" {
     fn xvid_global(handle: *mut c_void, opt: c_int, p1: *mut c_void, p2: *mut c_void) -> c_int;
