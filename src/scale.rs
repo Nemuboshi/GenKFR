@@ -107,7 +107,7 @@ fn build_axis(src_dim: u32, dst_dim: u32, shift: f64) -> Result<Axis> {
         }
 
         start.push(first);
-        count.push((merged.last().unwrap().0 - first + 1) as u32);
+        count.push(merged.last().unwrap().0 - first + 1);
         offset.push(weights.len() as u32);
         for t in &merged {
             weights.push(t.1);
@@ -122,114 +122,275 @@ fn build_axis(src_dim: u32, dst_dim: u32, shift: f64) -> Result<Axis> {
     })
 }
 
-/// Apply one axis of the filter to a plane of `src_w` by `src_h` samples.
-///
-/// `horizontal` selects the axis. `stride` is the row length of `src` in
-/// bytes; the output is tightly packed.
-#[allow(clippy::too_many_arguments)]
-fn apply_axis(
-    src: &[u8],
-    src_w: u32,
-    src_h: u32,
-    stride: usize,
-    axis: &Axis,
-    dst_len: u32,
-    horizontal: bool,
-) -> Vec<u8> {
-    let out_len = if horizontal {
-        src_h as usize
-    } else {
-        src_w as usize
-    } * dst_len as usize;
-    let mut out = vec![0u8; out_len];
-
-    if horizontal {
-        for y in 0..src_h as usize {
-            let row = &src[y * stride..];
-            for i in 0..dst_len as usize {
-                let s = axis.start[i] as usize;
-                let n = axis.count[i] as usize;
-                let mut acc = 0.0f32;
-                for k in 0..n {
-                    let w = axis.weights[axis.offset[i] as usize + k];
-                    acc += w * f32::from(row[s + k]);
-                }
-                // zimg rounds the accumulator half away from zero.
-                out[y * dst_len as usize + i] = (acc + 0.5).floor().clamp(0.0, 255.0) as u8;
-            }
-        }
-    } else {
-        for i in 0..dst_len as usize {
-            let s = axis.start[i] as usize;
-            let n = axis.count[i] as usize;
-            for x in 0..src_w as usize {
-                let mut acc = 0.0f32;
-                for k in 0..n {
-                    let w = axis.weights[axis.offset[i] as usize + k];
-                    acc += w * f32::from(src[(s + k) * stride + x]);
-                }
-                out[i * src_w as usize + x] = (acc + 0.5).floor().clamp(0.0, 255.0) as u8;
-            }
-        }
-    }
-
-    out
-}
-
 /// A plane of 8-bit samples.
 pub struct Plane<'a> {
     pub data: &'a [u8],
     pub stride: usize,
 }
 
-/// Resize and crop one plane.
-///
-/// `dst_w` and `dst_h` are the output size. `crop` selects the source region.
-/// The returned buffer is tightly packed at `dst_w` bytes per row.
-pub fn resize_plane(
-    plane: Plane<'_>,
-    src_w: u32,
-    src_h: u32,
-    dst_w: u32,
-    dst_h: u32,
-    crop: Crop,
-) -> Result<Vec<u8>> {
-    if dst_w == 0 || dst_h == 0 {
-        bail!("resize needs a non-zero output size");
+/// Fixed filter coefficients and reusable buffers for one video plane.
+pub struct Resizer {
+    src_w: usize,
+    src_h: usize,
+    left: usize,
+    top: usize,
+    active_w: usize,
+    dst_w: usize,
+    hx: Axis,
+    vy: Axis,
+    horizontal: Vec<u8>,
+    output: Vec<u8>,
+    row: Vec<f32>,
+}
+
+impl Resizer {
+    pub fn new(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32, crop: Crop) -> Result<Self> {
+        if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+            bail!("resize needs non-zero input and output sizes");
+        }
+        let left = crop.left.unwrap_or(0.0);
+        let top = crop.top.unwrap_or(0.0);
+        let width = crop.width.unwrap_or(f64::from(src_w) - left);
+        let height = crop.height.unwrap_or(f64::from(src_h) - top);
+        if ![left, top, width, height].iter().all(|v| v.is_finite()) {
+            bail!("crop values must be finite");
+        }
+        if width.round() <= 0.0 || height.round() <= 0.0 {
+            bail!("crop leaves an empty region: {width} x {height}");
+        }
+        if left < 0.0
+            || top < 0.0
+            || left + width > f64::from(src_w)
+            || top + height > f64::from(src_h)
+        {
+            bail!("crop {left},{top} {width}x{height} is outside the {src_w}x{src_h} frame");
+        }
+        let active_w = width.round() as u32;
+        let active_h = height.round() as u32;
+        let horizontal_len = (active_h as usize)
+            .checked_mul(dst_w as usize)
+            .filter(|&len| len <= isize::MAX as usize)
+            .ok_or_else(|| anyhow::anyhow!("resize buffer exceeds the addressable range"))?;
+        let output_len = (dst_h as usize)
+            .checked_mul(dst_w as usize)
+            .filter(|&len| len <= isize::MAX as usize)
+            .ok_or_else(|| anyhow::anyhow!("resize buffer exceeds the addressable range"))?;
+        Ok(Self {
+            src_w: src_w as usize,
+            src_h: src_h as usize,
+            left: left.floor() as usize,
+            top: top.floor() as usize,
+            active_w: active_w as usize,
+            dst_w: dst_w as usize,
+            hx: build_axis(active_w, dst_w, left)?,
+            vy: build_axis(active_h, dst_h, top)?,
+            horizontal: vec![0; horizontal_len],
+            output: vec![0; output_len],
+            row: vec![0.0; dst_w as usize],
+        })
     }
 
-    // Default the crop to the full frame, as VapourSynth does.
-    let left = crop.left.unwrap_or(0.0);
-    let top = crop.top.unwrap_or(0.0);
-    let width = crop.width.unwrap_or(f64::from(src_w) - left);
-    let height = crop.height.unwrap_or(f64::from(src_h) - top);
-
-    if width <= 0.0 || height <= 0.0 {
-        bail!("crop leaves an empty region: {width} x {height}");
+    /// The tightly packed result stays valid until the next resize call.
+    pub fn resize(&mut self, plane: Plane<'_>) -> Result<&[u8]> {
+        let needed = plane
+            .stride
+            .checked_mul(self.src_h - 1)
+            .and_then(|len| len.checked_add(self.src_w));
+        if plane.stride < self.src_w || needed.is_none_or(|len| len > plane.data.len()) {
+            bail!("resize input is too small for its size and stride");
+        }
+        for (y, destination) in self.horizontal.chunks_exact_mut(self.dst_w).enumerate() {
+            let offset = (self.top + y) * plane.stride + self.left;
+            let source = &plane.data[offset..offset + self.active_w];
+            for (i, pixel) in destination.iter_mut().enumerate() {
+                let start = self.hx.start[i] as usize;
+                let count = self.hx.count[i] as usize;
+                let offset = self.hx.offset[i] as usize;
+                let weights = &self.hx.weights[offset..offset + count];
+                let pixels = &source[start..start + count];
+                let mut acc = 0.0f32;
+                for (&weight, &value) in weights.iter().zip(pixels) {
+                    acc += weight * f32::from(value);
+                }
+                *pixel = (acc + 0.5).floor().clamp(0.0, 255.0) as u8;
+            }
+        }
+        for (i, destination) in self.output.chunks_exact_mut(self.dst_w).enumerate() {
+            self.row.fill(0.0);
+            let start = self.vy.start[i] as usize * self.dst_w;
+            let count = self.vy.count[i] as usize;
+            let offset = self.vy.offset[i] as usize;
+            let weights = &self.vy.weights[offset..offset + count];
+            let rows = &self.horizontal[start..start + count * self.dst_w];
+            // Keep each pixel's tap order while processing contiguous rows for vectorization.
+            for (&weight, source) in weights.iter().zip(rows.chunks_exact(self.dst_w)) {
+                for (acc, &value) in self.row.iter_mut().zip(source) {
+                    *acc += weight * f32::from(value);
+                }
+            }
+            for (pixel, &acc) in destination.iter_mut().zip(&self.row) {
+                *pixel = (acc + 0.5).floor().clamp(0.0, 255.0) as u8;
+            }
+        }
+        Ok(&self.output)
     }
-    if left < 0.0 || top < 0.0 || left + width > f64::from(src_w) || top + height > f64::from(src_h)
-    {
-        bail!(
-            "crop {left},{top} {width}x{height} is outside the {src_w}x{src_h} frame"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Scalar indexing and accumulation from the previous implementation.
+    fn reference(resizer: &Resizer, data: &[u8], stride: usize) -> Vec<u8> {
+        let mut horizontal = vec![0; resizer.horizontal.len()];
+        for y in 0..horizontal.len() / resizer.dst_w {
+            for x in 0..resizer.dst_w {
+                let mut acc = 0.0f32;
+                for k in 0..resizer.hx.count[x] as usize {
+                    let weight = resizer.hx.weights[resizer.hx.offset[x] as usize + k];
+                    let index = (resizer.top + y) * stride
+                        + resizer.left
+                        + resizer.hx.start[x] as usize
+                        + k;
+                    acc += weight * f32::from(data[index]);
+                }
+                horizontal[y * resizer.dst_w + x] = (acc + 0.5).floor().clamp(0.0, 255.0) as u8;
+            }
+        }
+        let mut output = vec![0; resizer.output.len()];
+        for y in 0..resizer.vy.start.len() {
+            for x in 0..resizer.dst_w {
+                let mut acc = 0.0f32;
+                for k in 0..resizer.vy.count[y] as usize {
+                    let weight = resizer.vy.weights[resizer.vy.offset[y] as usize + k];
+                    let index = (resizer.vy.start[y] as usize + k) * resizer.dst_w + x;
+                    acc += weight * f32::from(horizontal[index]);
+                }
+                output[y * resizer.dst_w + x] = (acc + 0.5).floor().clamp(0.0, 255.0) as u8;
+            }
+        }
+        output
+    }
+
+    #[test]
+    fn keeps_rounding_between_the_two_filter_passes() {
+        let mut resizer = Resizer::new(2, 2, 1, 1, Crop::default()).unwrap();
+        assert_eq!(
+            resizer
+                .resize(Plane {
+                    data: &[0, 40, 80, 120],
+                    stride: 2
+                })
+                .unwrap(),
+            [60]
+        );
+        // Horizontal rows round to 1 and 2, then the vertical result rounds to 2.
+        assert_eq!(
+            resizer
+                .resize(Plane {
+                    data: &[0, 1, 1, 2],
+                    stride: 2
+                })
+                .unwrap(),
+            [2]
         );
     }
 
-    let hx = build_axis(width.round() as u32, dst_w, left)?;
-    let vy = build_axis(height.round() as u32, dst_h, top)?;
-
-    // The filter indexes the active region, so offset the source first.
-    let left_i = left.floor() as usize;
-    let top_i = top.floor() as usize;
-    let active_w = width.round() as u32;
-    let active_h = height.round() as u32;
-
-    let mut region = vec![0u8; active_w as usize * active_h as usize];
-    for y in 0..active_h as usize {
-        let src_row = (top_i + y) * plane.stride + left_i;
-        region[y * active_w as usize..(y + 1) * active_w as usize]
-            .copy_from_slice(&plane.data[src_row..src_row + active_w as usize]);
+    #[test]
+    fn preserves_scalar_pixels_and_reuses_buffers() {
+        let mut state = 42u32;
+        for (sw, sh, dw, dh, crop) in [
+            (1, 1, 3, 5, Crop::default()),
+            (5, 7, 2, 3, Crop::default()),
+            (6, 4, 11, 9, Crop::default()),
+            (65, 49, 32, 24, Crop::default()),
+            (
+                17,
+                19,
+                6,
+                4,
+                Crop {
+                    left: Some(2.25),
+                    top: Some(1.25),
+                    width: Some(11.5),
+                    height: Some(12.5),
+                },
+            ),
+        ] {
+            let mut resizer = Resizer::new(sw, sh, dw, dh, crop).unwrap();
+            let pointers = (
+                resizer.horizontal.as_ptr(),
+                resizer.output.as_ptr(),
+                resizer.row.as_ptr(),
+            );
+            for padding in [0, 7] {
+                let stride = sw as usize + padding;
+                for _ in 0..3 {
+                    let data: Vec<_> = (0..stride * (sh as usize - 1) + sw as usize)
+                        .map(|_| {
+                            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                            (state >> 24) as u8
+                        })
+                        .collect();
+                    let expected = reference(&resizer, &data, stride);
+                    assert_eq!(
+                        resizer
+                            .resize(Plane {
+                                data: &data,
+                                stride
+                            })
+                            .unwrap(),
+                        expected
+                    );
+                    assert_eq!(
+                        pointers,
+                        (
+                            resizer.horizontal.as_ptr(),
+                            resizer.output.as_ptr(),
+                            resizer.row.as_ptr()
+                        )
+                    );
+                }
+            }
+        }
     }
 
-    let horiz = apply_axis(&region, active_w, active_h, active_w as usize, &hx, dst_w, true);
-    Ok(apply_axis(&horiz, dst_w, active_h, dst_w as usize, &vy, dst_h, false))
+    #[test]
+    fn rejects_invalid_dimensions_crops_and_planes() {
+        for size in [(0, 4, 2, 2), (4, 0, 2, 2), (4, 4, 0, 2), (4, 4, 2, 0)] {
+            assert!(Resizer::new(size.0, size.1, size.2, size.3, Crop::default()).is_err());
+        }
+        for left in [-1.0, f64::NAN, f64::INFINITY, 4.0] {
+            assert!(
+                Resizer::new(
+                    4,
+                    4,
+                    2,
+                    2,
+                    Crop {
+                        left: Some(left),
+                        ..Crop::default()
+                    }
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            Resizer::new(
+                4,
+                4,
+                2,
+                2,
+                Crop {
+                    width: Some(0.4),
+                    ..Crop::default()
+                }
+            )
+            .is_err()
+        );
+        let mut resizer = Resizer::new(4, 4, 2, 2, Crop::default()).unwrap();
+        for (data, stride) in [(&[0; 16][..], 3), (&[0; 15][..], 4), (&[][..], usize::MAX)] {
+            assert!(resizer.resize(Plane { data, stride }).is_err());
+        }
+    }
 }

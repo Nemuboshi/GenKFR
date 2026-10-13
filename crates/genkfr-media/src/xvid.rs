@@ -422,6 +422,7 @@ mod tests {
             (34, 18, 4),
             (66, 50, 2),
             (258, 130, 4),
+            (800, 360, 16),
         ] {
             let mut encoder = Xvid::new(w, h, threads).unwrap();
             for padding in [0, 1, 7] {

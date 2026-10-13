@@ -461,14 +461,14 @@ mod tests {
             (3, 3, 0),
             (3, -1, 2),
         ] {
-            // SAFETY: invalid layouts/null pointers are rejected before access.
             assert!(
+                // SAFETY: invalid layouts/null pointers are rejected before access.
                 unsafe { copy_plane(std::ptr::null(), stride, width, height, &mut output) }
                     .is_err()
             );
         }
-        // SAFETY: address overflow is rejected before accessing this pointer.
         assert!(
+            // SAFETY: address overflow is rejected before accessing this pointer.
             unsafe {
                 copy_plane(
                     std::ptr::without_provenance(usize::MAX),

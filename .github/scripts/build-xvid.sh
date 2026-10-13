@@ -43,7 +43,7 @@ c=(
 export MSYS_NO_PATHCONV=1
 cd "$root"
 cp xvidcore/src/xvid.h "$temp/xvid.h"
-flags=(/nologo /c /O2 /MD /DWIN32 /D_WINDOWS /DARCH_IS_64BIT /D_CRT_SECURE_NO_WARNINGS /DNDEBUG)
+flags=(/nologo /c /O2 /MD /DWIN32 /D_WINDOWS /DHAVE_PTHREAD /DARCH_IS_64BIT /D_CRT_SECURE_NO_WARNINGS /DNDEBUG)
 if [[ "${GENKFR_ASAN:-0}" == 1 ]]; then
   # Compile out assembly dispatch and CPU detection, rather than only forcing C at runtime.
   flags+=(/DARCH_IS_GENERIC /fsanitize=address /Z7)
@@ -57,6 +57,10 @@ for f in "${c[@]}"; do
   cl.exe "${flags[@]}" \
     "/Fo$(cygpath -w "${out%.c}.obj")" "$(cygpath -w "xvidcore/src/$f")"
 done
+
+# Fail if the compiler omitted xvid's Windows worker code.
+dumpbin.exe /nologo /symbols "$(cygpath -w "$obj/encoder.obj")" > "$obj/encoder-symbols.txt"
+grep -q '__imp_CreateThread' "$obj/encoder-symbols.txt" || { echo 'xvid was built without Windows worker threads' >&2; exit 1; }
 
 # The assembly, from the same sources file.
 asm=(

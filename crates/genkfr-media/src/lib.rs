@@ -1,7 +1,7 @@
 //! Safe decoding and scene detection for GenKFR.
 //! Native declarations are generated from the headers and stay private.
 
-#![deny(unsafe_op_in_unsafe_fn)]
+#![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
 
 mod decode;
 mod plane;

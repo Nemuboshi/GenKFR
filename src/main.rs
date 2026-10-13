@@ -106,9 +106,33 @@ fn process_input(input: &Path, crop: Crop, threads: i32) -> Result<()> {
     let mut encoder = Xvid::new(target_w, TARGET_HEIGHT, threads)?;
     let mut keyframes: Vec<i32> = Vec::new();
 
-    let mut luma = Vec::new();
-    let mut chroma_u = Vec::new();
-    let mut chroma_v = Vec::new();
+    let mut luma = scale::Resizer::new(
+        source_w,
+        source_h,
+        target_w as u32,
+        TARGET_HEIGHT as u32,
+        crop,
+    )?;
+    let half_crop = Crop {
+        left: crop.left.map(|v| v / 2.0),
+        top: crop.top.map(|v| v / 2.0),
+        width: crop.width.map(|v| v / 2.0),
+        height: crop.height.map(|v| v / 2.0),
+    };
+    let mut chroma_u = scale::Resizer::new(
+        source_w.div_ceil(2),
+        source_h.div_ceil(2),
+        (target_w as u32).div_ceil(2),
+        (TARGET_HEIGHT as u32).div_ceil(2),
+        half_crop,
+    )?;
+    let mut chroma_v = scale::Resizer::new(
+        source_w.div_ceil(2),
+        source_h.div_ceil(2),
+        (target_w as u32).div_ceil(2),
+        (TARGET_HEIGHT as u32).div_ceil(2),
+        half_crop,
+    )?;
 
     for number in 0..decoder.num_frames() {
         if number % 1000 == 0 {
@@ -116,52 +140,20 @@ fn process_input(input: &Path, crop: Crop, threads: i32) -> Result<()> {
         }
 
         let frame = decoder.frame(number)?;
-        scale::resize_plane(
-            scale::Plane {
-                data: frame.y,
-                stride: frame.y_stride,
-            },
-            source_w,
-            source_h,
-            target_w as u32,
-            TARGET_HEIGHT as u32,
-            crop,
-        )?
-        .clone_into(&mut luma);
+        let y = luma.resize(scale::Plane {
+            data: frame.y,
+            stride: frame.y_stride,
+        })?;
+        let u = chroma_u.resize(scale::Plane {
+            data: frame.u,
+            stride: frame.uv_stride,
+        })?;
+        let v = chroma_v.resize(scale::Plane {
+            data: frame.v,
+            stride: frame.uv_stride,
+        })?;
 
-        // Chroma uses the same crop and scale, in half resolution.
-        let half_crop = Crop {
-            left: crop.left.map(|v| v / 2.0),
-            top: crop.top.map(|v| v / 2.0),
-            width: crop.width.map(|v| v / 2.0),
-            height: crop.height.map(|v| v / 2.0),
-        };
-        scale::resize_plane(
-            scale::Plane {
-                data: frame.u,
-                stride: frame.uv_stride,
-            },
-            source_w.div_ceil(2),
-            source_h.div_ceil(2),
-            (target_w as u32).div_ceil(2),
-            (TARGET_HEIGHT as u32).div_ceil(2),
-            half_crop,
-        )?
-        .clone_into(&mut chroma_u);
-        scale::resize_plane(
-            scale::Plane {
-                data: frame.v,
-                stride: frame.uv_stride,
-            },
-            source_w.div_ceil(2),
-            source_h.div_ceil(2),
-            (target_w as u32).div_ceil(2),
-            (TARGET_HEIGHT as u32).div_ceil(2),
-            half_crop,
-        )?
-        .clone_into(&mut chroma_v);
-
-        if encoder.is_keyframe(&luma, &chroma_u, &chroma_v, target_w, target_w / 2)? {
+        if encoder.is_keyframe(y, u, v, target_w, target_w / 2)? {
             keyframes.push(number);
         }
     }

@@ -66,7 +66,15 @@ FFMPEG_DIR=D:/libs/ffmpeg XVIDCORE_DIR=D:/libs/xvidcore LIBCLANG_PATH='C:/Progra
 ```
 
 `.github/scripts/build-xvid.sh` builds xvidcore and places its header beside
-the static library. The release workflow uses this script. The independent
+the static library. Windows xvid builds must define `HAVE_PTHREAD` to enable
+worker threads. xvid maps these calls to native Windows threads. The script
+checks that the encoder object contains the thread creation call.
+
+The resizer caches filter coefficients and reuses its buffers for each video
+plane. It preserves the pixel accumulation order and the 8-bit rounding after
+each filter pass.
+
+The release workflow uses this script. The independent
 test workflow is `.github/workflows/tests.yml`:
 
 ```bash
