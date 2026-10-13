@@ -54,10 +54,16 @@ fn main() {
 
     build.compile("ffms2");
 
+    println!("cargo:rustc-link-search=native={}", lib.display());
+
     // FFmpeg's own libraries. The list follows FFMS2's Visual Studio project.
-    for name in [
-        "avformat", "avcodec", "swscale", "swresample", "avutil", "zlib",
-    ] {
+    //
+    // The zlib archive has no stable file name. zlib 1.3.2 renamed it: the
+    // static library is `zs.lib` and `z.lib` is the DLL import library, so a
+    // static triplet has neither `zlib.lib` nor `z.lib`. Older ports ship
+    // `zlib.lib`. Ask the prefix what it has, or the link fails with LNK1181.
+    let zlib = pick_zlib(&lib);
+    for name in ["avformat", "avcodec", "swscale", "swresample", "avutil", zlib] {
         println!("cargo:rustc-link-lib=static={name}");
     }
 
@@ -69,8 +75,19 @@ fn main() {
     ] {
         println!("cargo:rustc-link-lib={name}");
     }
+}
 
-    println!("cargo:rustc-link-search=native={}", lib.display());
+/// Name the zlib library to link, from the files the prefix actually has.
+///
+/// `zs` first: that is what vcpkg's static triplets ship since zlib 1.3.2.
+/// Falls back to `z` on non-MSVC prefixes, where the archive is `libz.a`.
+fn pick_zlib(lib: &Path) -> &'static str {
+    for name in ["zs", "zlib", "z"] {
+        if lib.join(format!("{name}.lib")).is_file() {
+            return name;
+        }
+    }
+    "z"
 }
 
 /// Find the FFmpeg prefix.

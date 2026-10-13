@@ -7,6 +7,9 @@ name: Windows Release
 # version and reuses the asset after that, so this workflow does not build
 # FFmpeg and needs no vcpkg.
 #
+# If the asset is missing, this workflow starts that build as its own separate
+# run and waits for it. Nothing FFmpeg-related appears in this run's job list.
+#
 # xvidcore is built from its own repository. FFMS2 is a submodule, compiled by
 # build.rs.
 
@@ -18,29 +21,21 @@ on:
 
 permissions:
   contents: write
+  # Needed to start the FFmpeg workflow with the built-in token. A
+  # workflow_dispatch triggered by GITHUB_TOKEN does create a run.
+  actions: write
 
 env:
   # The FFmpeg version to link. Must match a release published by
-  # ffmpeg-libs.yml, or that workflow will build it first.
+  # ffmpeg-libs.yml, or that workflow is started to build it.
   FFMPEG_VERSION: '9.0.2'
   XVIDCORE_VERSION: '1.3.7'
   NASM_VERSION: '2.16.03'
 
 jobs:
-  # Build the FFmpeg libraries, or reuse the release if it already exists.
-  ffmpeg:
-    name: FFmpeg libraries
-    uses: ./.github/workflows/ffmpeg-libs.yml
-    permissions:
-      contents: write
-    with:
-      # Keep this in step with FFMPEG_VERSION above.
-      version: '9.0.2'
-
   build:
     name: Build genkfr
     runs-on: windows-latest
-    needs: ffmpeg
 
     steps:
       # The FFMS2 submodule holds the sources that build.rs compiles.
@@ -57,9 +52,46 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "${{ needs.ffmpeg.outputs.tag }}"
+          # The tag ffmpeg-libs.yml publishes to: ffmpeg-libs-<version>.
+          $tag = "ffmpeg-libs-$env:FFMPEG_VERSION"
           $dir = Join-Path $env:RUNNER_TEMP 'ffmpeg'
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
+
+          function Get-AssetCount {
+            $json = & gh release view $tag --json assets 2>$null | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0 -or -not $json) { return 0 }
+            return @($json.assets).Count
+          }
+
+          if ((Get-AssetCount) -eq 0) {
+            Write-Output "release $tag is empty, starting the FFmpeg build"
+            # The workflow file must exist at this ref. Both the tag of a tag
+            # push and the branch of a manual run hold it.
+            & gh workflow run ffmpeg-libs.yml --ref $env:GITHUB_REF_NAME -f version=$env:FFMPEG_VERSION
+            if ($LASTEXITCODE -ne 0) { throw 'cannot start the FFmpeg Static Libraries workflow' }
+
+            # shortcut: the build takes about 15 minutes; 60 is the ceiling.
+            # Raise it if a cold vcpkg run needs longer.
+            $start = [datetime]::UtcNow
+            $deadline = $start.AddMinutes(60)
+            while ((Get-AssetCount) -eq 0) {
+              if ([datetime]::UtcNow -gt $deadline) {
+                throw "the FFmpeg build did not publish $tag within 60 minutes"
+              }
+              Start-Sleep -Seconds 30
+              # Report a dead build instead of waiting for the deadline.
+              # conclusion is null while a run is queued or in progress.
+              $runs = @(& gh run list --workflow ffmpeg-libs.yml --limit 1 `
+                          --json createdAt,conclusion,url 2>$null | ConvertFrom-Json)
+              $run = $runs | Select-Object -First 1
+              if ($run -and $null -ne $run.conclusion `
+                  -and [datetime]::Parse($run.createdAt).ToUniversalTime() -ge $start) {
+                throw "the FFmpeg build ended without an asset: $($run.url) ($($run.conclusion))"
+              }
+            }
+            Write-Output "release $tag is ready"
+          }
+
           & gh release download $tag --pattern '*.zip' --dir $dir
           if ($LASTEXITCODE -ne 0) { throw "cannot download the assets of $tag" }
 

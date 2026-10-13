@@ -8,8 +8,9 @@ name: FFmpeg Static Libraries
 # checked before the build starts: if the asset for this version already
 # exists, nothing is rebuilt.
 #
-# This workflow is called by windows-release.yml and can also be run by hand
-# when a new FFmpeg version is wanted.
+# Run this by hand when a new FFmpeg version is wanted. windows-release.yml
+# only downloads the asset, it never builds FFmpeg, so a missing release makes
+# that workflow fail until you run this one.
 
 on:
   workflow_dispatch:
