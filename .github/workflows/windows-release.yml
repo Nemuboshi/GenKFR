@@ -1,17 +1,8 @@
 name: Windows Release
 
 # Builds a single genkfr.exe with no DLL files beside it.
-#
-# FFmpeg comes from the `FFmpeg Static Libraries` workflow, which publishes the
-# static libraries as a release asset. That workflow builds them once per
-# version and reuses the asset after that, so this workflow does not build
-# FFmpeg and needs no vcpkg.
-#
-# If the asset is missing, this workflow starts that build as its own separate
-# run and waits for it. Nothing FFmpeg-related appears in this run's job list.
-#
-# xvidcore is built from its own repository. FFMS2 is a submodule, compiled by
-# build.rs.
+# FFmpeg is downloaded from a release asset. If missing, start its separate
+# workflow and wait for it. xvidcore is built here; build.rs compiles FFMS2.
 
 on:
   push:
@@ -21,13 +12,14 @@ on:
 
 permissions:
   contents: write
-  # Needed to start the FFmpeg workflow with the built-in token. A
-  # workflow_dispatch triggered by GITHUB_TOKEN does create a run.
+  # GITHUB_TOKEN can start a separate workflow_dispatch run.
   actions: write
 
+defaults:
+  run:
+    shell: bash
+
 env:
-  # The FFmpeg version to link. Must match a release published by
-  # ffmpeg-libs.yml, or that workflow is started to build it.
   FFMPEG_VERSION: '9.0.2'
   XVIDCORE_VERSION: '1.3.7'
   NASM_VERSION: '2.16.03'
@@ -38,215 +30,175 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      # The FFMS2 submodule holds the sources that build.rs compiles.
       - uses: actions/checkout@v6
         with:
           submodules: true
+
+      - name: Test release asset lookup
+        run: bash .github/scripts/test-ffmpeg-asset.sh
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
 
       - name: Download the FFmpeg libraries
-        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # The tag ffmpeg-libs.yml publishes to: ffmpeg-libs-<version>.
-          $tag = "ffmpeg-libs-$env:FFMPEG_VERSION"
-          $dir = Join-Path $env:RUNNER_TEMP 'ffmpeg'
-          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          tag="ffmpeg-libs-$FFMPEG_VERSION"
+          dir="$(cygpath -u "$RUNNER_TEMP")/ffmpeg"
+          mkdir -p "$dir"
+          found="$(bash .github/scripts/ffmpeg-asset.sh "$tag")"
 
-          function Get-AssetCount {
-            $json = & gh release view $tag --json assets 2>$null | ConvertFrom-Json
-            if ($LASTEXITCODE -ne 0 -or -not $json) { return 0 }
-            return @($json.assets).Count
-          }
+          if [[ "$found" != true ]]; then
+            echo "release $tag has no expected asset, starting the FFmpeg build"
+            start="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            gh workflow run ffmpeg-libs.yml --ref "$GITHUB_REF_NAME" -f "version=$FFMPEG_VERSION"
 
-          if ((Get-AssetCount) -eq 0) {
-            Write-Output "release $tag is empty, starting the FFmpeg build"
-            # The workflow file must exist at this ref. Both the tag of a tag
-            # push and the branch of a manual run hold it.
-            & gh workflow run ffmpeg-libs.yml --ref $env:GITHUB_REF_NAME -f version=$env:FFMPEG_VERSION
-            if ($LASTEXITCODE -ne 0) { throw 'cannot start the FFmpeg Static Libraries workflow' }
+            # shortcut: stop after 60 minutes; raise this if cold builds need longer.
+            deadline=$((SECONDS + 3600))
+            while true; do
+              found="$(bash .github/scripts/ffmpeg-asset.sh "$tag")"
+              [[ "$found" == true ]] && break
+              (( SECONDS < deadline )) || { echo "the FFmpeg build did not publish $tag within 60 minutes" >&2; exit 1; }
+              sleep 30
 
-            # shortcut: the build takes about 15 minutes; 60 is the ceiling.
-            # Raise it if a cold vcpkg run needs longer.
-            $start = [datetime]::UtcNow
-            $deadline = $start.AddMinutes(60)
-            while ((Get-AssetCount) -eq 0) {
-              if ([datetime]::UtcNow -gt $deadline) {
-                throw "the FFmpeg build did not publish $tag within 60 minutes"
-              }
-              Start-Sleep -Seconds 30
-              # Report a dead build instead of waiting for the deadline.
-              # conclusion is null while a run is queued or in progress.
-              $runs = @(& gh run list --workflow ffmpeg-libs.yml --limit 1 `
-                          --json createdAt,conclusion,url 2>$null | ConvertFrom-Json)
-              $run = $runs | Select-Object -First 1
-              if ($run -and $null -ne $run.conclusion `
-                  -and [datetime]::Parse($run.createdAt).ToUniversalTime() -ge $start) {
-                throw "the FFmpeg build ended without an asset: $($run.url) ($($run.conclusion))"
-              }
-            }
-            Write-Output "release $tag is ready"
-          }
+              # Only consider completed dispatches from this ref, not old runs.
+              run="$(gh run list --workflow ffmpeg-libs.yml --branch "$GITHUB_REF_NAME" \
+                --event workflow_dispatch --status completed --limit 1 \
+                --json createdAt,conclusion,url \
+                --jq '.[0] | select(. != null) | [.createdAt, .conclusion, .url] | @tsv')"
+              IFS=$'\t' read -r created conclusion url <<< "$run"
+              if [[ -n "$run" && ( "$created" > "$start" || "$created" == "$start" ) ]]; then
+                found="$(bash .github/scripts/ffmpeg-asset.sh "$tag")"
+                if [[ "$found" != true ]]; then
+                  echo "the FFmpeg build ended without an asset: $url ($conclusion)" >&2
+                  exit 1
+                fi
+              fi
+            done
+            echo "release $tag is ready"
+          fi
 
-          & gh release download $tag --pattern '*.zip' --dir $dir
-          if ($LASTEXITCODE -ne 0) { throw "cannot download the assets of $tag" }
+          gh release download "$tag" --pattern "$tag.zip" --dir "$dir" --clobber
+          7z x "$dir/$tag.zip" "-o$(cygpath -w "$dir")" -y
+          [[ -d "$dir/include" ]] || { echo 'the archive has no include directory' >&2; exit 1; }
+          [[ -d "$dir/lib" ]] || { echo 'the archive has no lib directory' >&2; exit 1; }
+          echo "FFmpeg libraries from $tag"
+          if [[ -f "$dir/PACKAGES.txt" ]]; then cat "$dir/PACKAGES.txt"; fi
 
-          $zip = Get-ChildItem $dir -Filter *.zip | Select-Object -First 1
-          if (-not $zip) { throw "no archive in $tag" }
-          Expand-Archive -Path $zip.FullName -DestinationPath $dir -Force
-
-          if (-not (Test-Path "$dir\include")) { throw 'the archive has no include directory' }
-          if (-not (Test-Path "$dir\lib")) { throw 'the archive has no lib directory' }
-          Write-Output "FFmpeg libraries from $tag"
-          if (Test-Path "$dir\PACKAGES.txt") { Get-Content "$dir\PACKAGES.txt" }
-
-      # The runner does not put MSVC on PATH. Import the environment that
-      # vcvars64.bat sets, once, for every later step.
+      # Imports vcvars into later steps, including Bash, without a shell bridge.
       - name: Set up the MSVC environment
-        shell: pwsh
-        run: |
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          if (-not (Test-Path $vswhere)) { throw 'vswhere.exe is missing' }
-          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-                  -property installationPath
-          if (-not $vs) { throw 'no Visual Studio with the C++ tools' }
-          $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
-          if (-not (Test-Path $vcvars)) { throw "vcvars64.bat is missing at $vcvars" }
-
-          cmd /c "`"$vcvars`" >nul 2>&1 && set" | ForEach-Object {
-            if ($_ -match '^([^=]+)=(.*)$') {
-              Add-Content -Path $env:GITHUB_ENV -Value "$($Matches[1])=$($Matches[2])"
-            }
-          }
-          Write-Output "VS at $vs"
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
       - name: Install NASM
-        shell: pwsh
         run: |
-          # xvidcore needs an assembler for its 35 assembly files. The runner
-          # does not ship one.
-          $zip = Join-Path $env:RUNNER_TEMP 'nasm.zip'
-          $dir = Join-Path $env:RUNNER_TEMP 'nasm'
-          $url = "https://www.nasm.us/pub/nasm/releasebuilds/$env:NASM_VERSION/win64/nasm-$env:NASM_VERSION-win64.zip"
-          Invoke-WebRequest -Uri $url -OutFile $zip
-          Expand-Archive -Path $zip -DestinationPath $dir -Force
-          $nasm = Join-Path $dir "nasm-$env:NASM_VERSION\nasm.exe"
-          if (-not (Test-Path $nasm)) { throw "nasm.exe is missing at $nasm" }
-          Add-Content -Path $env:GITHUB_ENV -Value "NASM=$nasm"
-          & $nasm -v
+          temp="$(cygpath -u "$RUNNER_TEMP")"
+          zip="$temp/nasm.zip"
+          dir="$temp/nasm"
+          url="https://www.nasm.us/pub/nasm/releasebuilds/$NASM_VERSION/win64/nasm-$NASM_VERSION-win64.zip"
+          curl --fail --location --retry 3 --output "$zip" "$url"
+          7z x "$zip" "-o$(cygpath -w "$dir")" -y
+          nasm="$dir/nasm-$NASM_VERSION/nasm.exe"
+          [[ -f "$nasm" ]] || { echo "nasm.exe is missing at $nasm" >&2; exit 1; }
+          echo "NASM=$(cygpath -m "$nasm")" >> "$GITHUB_ENV"
+          "$nasm" -v
 
       - name: Build xvidcore
-        shell: pwsh
         run: |
-          $root = Join-Path $env:RUNNER_TEMP 'xvidcore'
-          $tag = "release-$($env:XVIDCORE_VERSION -replace '\.','_')"
-          # The tag is immutable, unlike the release-1_3-branch.
-          git clone --depth 1 --branch $tag https://github.com/arthenica/xvidcore.git $root
-          if ($LASTEXITCODE -ne 0) { throw "cannot clone xvidcore $tag" }
-
-          $obj = Join-Path $env:RUNNER_TEMP 'xvid-obj'
-          New-Item -ItemType Directory -Force -Path $obj | Out-Null
+          temp="$(cygpath -u "$RUNNER_TEMP")"
+          root="$temp/xvidcore"
+          tag="release-${XVIDCORE_VERSION//./_}"
+          git clone --depth 1 --branch "$tag" https://github.com/arthenica/xvidcore.git "$root"
+          obj="$temp/xvid-obj"
+          mkdir -p "$obj"
 
           # The C sources, from build/generic/sources.inc.
-          $c = @(
-            'decoder.c','encoder.c','xvid.c',
-            'bitstream\bitstream.c','bitstream\cbp.c','bitstream\mbcoding.c',
-            'dct\fdct.c','dct\idct.c','dct\simple_idct.c',
-            'image\colorspace.c','image\image.c','image\interpolate8x8.c',
-            'image\font.c','image\postprocessing.c','image\qpel.c','image\reduced.c',
-            'motion\estimation_bvop.c','motion\estimation_common.c','motion\estimation_gmc.c',
-            'motion\estimation_pvop.c','motion\estimation_rd_based.c',
-            'motion\estimation_rd_based_bvop.c','motion\gmc.c','motion\motion_comp.c',
-            'motion\vop_type_decision.c','motion\sad.c',
-            'prediction\mbprediction.c',
-            'plugins\plugin_single.c','plugins\plugin_2pass1.c','plugins\plugin_2pass2.c',
-            'plugins\plugin_lumimasking.c','plugins\plugin_dump.c','plugins\plugin_psnr.c',
-            'plugins\plugin_ssim.c','plugins\plugin_psnrhvsm.c',
-            'quant\quant_h263.c','quant\quant_matrix.c','quant\quant_mpeg.c',
-            'utils\emms.c','utils\mbtransquant.c','utils\mem_align.c',
-            'utils\mem_transfer.c','utils\timer.c'
+          c=(
+            decoder.c encoder.c xvid.c
+            bitstream/bitstream.c bitstream/cbp.c bitstream/mbcoding.c
+            dct/fdct.c dct/idct.c dct/simple_idct.c
+            image/colorspace.c image/image.c image/interpolate8x8.c
+            image/font.c image/postprocessing.c image/qpel.c image/reduced.c
+            motion/estimation_bvop.c motion/estimation_common.c motion/estimation_gmc.c
+            motion/estimation_pvop.c motion/estimation_rd_based.c
+            motion/estimation_rd_based_bvop.c motion/gmc.c motion/motion_comp.c
+            motion/vop_type_decision.c motion/sad.c
+            prediction/mbprediction.c
+            plugins/plugin_single.c plugins/plugin_2pass1.c plugins/plugin_2pass2.c
+            plugins/plugin_lumimasking.c plugins/plugin_dump.c plugins/plugin_psnr.c
+            plugins/plugin_ssim.c plugins/plugin_psnrhvsm.c
+            quant/quant_h263.c quant/quant_matrix.c quant/quant_mpeg.c
+            utils/emms.c utils/mbtransquant.c utils/mem_align.c
+            utils/mem_transfer.c utils/timer.c
           )
-          # WIN32 selects the Windows headers and the thread shims in portab.h.
-          $defs = @('/nologo','/c','/O2','/DWIN32','/D_WINDOWS','/DARCH_IS_X86_64',
-                    '/DARCH_IS_64BIT','/D_CRT_SECURE_NO_WARNINGS','/DNDEBUG')
+          # Disable MSYS argument conversion so /O2 and /Fo reach MSVC unchanged.
+          export MSYS_NO_PATHCONV=1
+          cd "$root"
+          for f in "${c[@]}"; do
+            out="$obj/${f//\//_}"
+            cl.exe /nologo /c /O2 /MD /DWIN32 /D_WINDOWS /DARCH_IS_X86_64 \
+              /DARCH_IS_64BIT /D_CRT_SECURE_NO_WARNINGS /DNDEBUG \
+              "/Fo$(cygpath -w "${out%.c}.obj")" "$(cygpath -w "xvidcore/src/$f")"
+          done
 
-          Push-Location $root
-          try {
-            foreach ($f in $c) {
-              & cl.exe @defs "/Fo$obj\" "xvidcore\src\$f"
-              if ($LASTEXITCODE -ne 0) { throw "cl failed on $f" }
-            }
+          # The assembly, from the same sources file.
+          asm=(
+            bitstream/x86_asm/cbp_mmx.asm bitstream/x86_asm/cbp_sse2.asm
+            dct/x86_asm/fdct_mmx_ffmpeg.asm dct/x86_asm/fdct_mmx_skal.asm
+            dct/x86_asm/fdct_sse2_skal.asm dct/x86_asm/idct_3dne.asm
+            dct/x86_asm/idct_mmx.asm dct/x86_asm/idct_sse2_dmitry.asm
+            image/x86_asm/colorspace_rgb_mmx.asm image/x86_asm/colorspace_yuv_mmx.asm
+            image/x86_asm/colorspace_yuyv_mmx.asm image/x86_asm/interpolate8x8_3dn.asm
+            image/x86_asm/interpolate8x8_3dne.asm image/x86_asm/interpolate8x8_mmx.asm
+            image/x86_asm/interpolate8x8_xmm.asm image/x86_asm/postprocessing_mmx.asm
+            image/x86_asm/postprocessing_sse2.asm image/x86_asm/reduced_mmx.asm
+            image/x86_asm/qpel_mmx.asm image/x86_asm/gmc_mmx.asm
+            image/x86_asm/deintl_sse.asm
+            motion/x86_asm/sad_xmm.asm motion/x86_asm/sad_sse2.asm
+            motion/x86_asm/sad_mmx.asm motion/x86_asm/sad_3dne.asm
+            motion/x86_asm/sad_3dn.asm
+            quant/x86_asm/quantize_h263_mmx.asm quant/x86_asm/quantize_h263_3dne.asm
+            quant/x86_asm/quantize_mpeg_xmm.asm quant/x86_asm/quantize_mpeg_mmx.asm
+            utils/x86_asm/mem_transfer_mmx.asm utils/x86_asm/mem_transfer_3dne.asm
+            utils/x86_asm/interlacing_mmx.asm utils/x86_asm/cpuid.asm
+            plugins/x86_asm/plugin_ssim-a.asm
+          )
+          for f in "${asm[@]}"; do
+            src="xvidcore/src/$f"
+            out="$obj/${f//\//_}"
+            # WINDOWS selects the MS calling convention; NO_PREFIX omits '_'.
+            "$NASM" "-I$(cygpath -m "$(dirname "$src")")/" "-I$(cygpath -m xvidcore/src)/" \
+              -f win64 -DWINDOWS -DNO_PREFIX -DARCH_IS_X86_64 \
+              "$(cygpath -w "$src")" -o "$(cygpath -w "${out%.asm}.obj")"
+          done
 
-            # The assembly, from the same sources file.
-            $asm = @(
-              'bitstream\x86_asm\cbp_mmx.asm','bitstream\x86_asm\cbp_sse2.asm',
-              'dct\x86_asm\fdct_mmx_ffmpeg.asm','dct\x86_asm\fdct_mmx_skal.asm',
-              'dct\x86_asm\fdct_sse2_skal.asm','dct\x86_asm\idct_3dne.asm',
-              'dct\x86_asm\idct_mmx.asm','dct\x86_asm\idct_sse2_dmitry.asm',
-              'image\x86_asm\colorspace_rgb_mmx.asm','image\x86_asm\colorspace_yuv_mmx.asm',
-              'image\x86_asm\colorspace_yuyv_mmx.asm','image\x86_asm\interpolate8x8_3dn.asm',
-              'image\x86_asm\interpolate8x8_3dne.asm','image\x86_asm\interpolate8x8_mmx.asm',
-              'image\x86_asm\interpolate8x8_xmm.asm','image\x86_asm\postprocessing_mmx.asm',
-              'image\x86_asm\postprocessing_sse2.asm','image\x86_asm\reduced_mmx.asm',
-              'image\x86_asm\qpel_mmx.asm','image\x86_asm\gmc_mmx.asm',
-              'image\x86_asm\deintl_sse.asm',
-              'motion\x86_asm\sad_xmm.asm','motion\x86_asm\sad_sse2.asm',
-              'motion\x86_asm\sad_mmx.asm','motion\x86_asm\sad_3dne.asm',
-              'motion\x86_asm\sad_3dn.asm',
-              'quant\x86_asm\quantize_h263_mmx.asm','quant\x86_asm\quantize_h263_3dne.asm',
-              'quant\x86_asm\quantize_mpeg_xmm.asm','quant\x86_asm\quantize_mpeg_mmx.asm',
-              'utils\x86_asm\mem_transfer_mmx.asm','utils\x86_asm\mem_transfer_3dne.asm',
-              'utils\x86_asm\interlacing_mmx.asm','utils\x86_asm\cpuid.asm',
-              'plugins\x86_asm\plugin_ssim-a.asm'
-            )
-            foreach ($f in $asm) {
-              $src = "xvidcore\src\$f"
-              $dir = Split-Path $src -Parent
-              $out = Join-Path $obj (($f -replace '[\\/]','_') -replace '\.asm$','.obj')
-              # -DWINDOWS selects the Microsoft calling convention in nasm.inc.
-              # -DNO_PREFIX stops it from adding a leading underscore, which the
-              # C objects do not have.
-              & $env:NASM -I"$dir\" -I"xvidcore\src\" -f win64 -DWINDOWS -DNO_PREFIX `
-                -DARCH_IS_X86_64 $src -o $out
-              if ($LASTEXITCODE -ne 0) { throw "nasm failed on $f" }
-            }
-          } finally {
-            Pop-Location
-          }
-
-          & lib.exe /nologo "/OUT:$env:RUNNER_TEMP\xvidcore.lib" "$obj\*.obj"
-          if ($LASTEXITCODE -ne 0) { throw 'lib failed for xvidcore' }
-          Write-Output "xvidcore.lib built"
+          objects=()
+          for f in "$obj"/*.obj; do objects+=("$(cygpath -w "$f")"); done
+          lib.exe /nologo "/OUT:$(cygpath -w "$temp/xvidcore.lib")" "${objects[@]}"
+          echo 'xvidcore.lib built'
 
       - name: Build genkfr
-        shell: pwsh
         run: |
-          # build.rs compiles the FFMS2 submodule and finds FFmpeg through
-          # FFMPEG_DIR. xvidcore is found through RUSTFLAGS.
-          $env:FFMPEG_DIR = Join-Path $env:RUNNER_TEMP 'ffmpeg'
-          $env:RUSTFLAGS = "-L native=$env:RUNNER_TEMP"
-
+          # Native paths are needed by Rust, not Git Bash's /c/... paths.
+          export FFMPEG_DIR="$(cygpath -m "$RUNNER_TEMP")/ffmpeg"
+          # Cargo's unit separator preserves paths containing spaces.
+          export CARGO_ENCODED_RUSTFLAGS="-L"$'\x1f'"native=$(cygpath -m "$RUNNER_TEMP")"
           cargo build --release
-          if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
-
-          New-Item -ItemType Directory -Force -Path out | Out-Null
-          Copy-Item target/release/genkfr.exe out/genkfr.exe -Force
+          mkdir -p out
+          cp target/release/genkfr.exe out/genkfr.exe
 
       - name: Check that the executable is self-contained
-        shell: pwsh
         run: |
-          # A dependency on an FFmpeg or FFMS2 DLL would mean the static link
-          # failed. System DLLs are expected.
-          $exe = 'out\genkfr.exe'
-          $dump = & dumpbin /dependents $exe
-          Write-Output $dump
-          $bad = $dump | Select-String -Pattern 'avcodec|avformat|avutil|swscale|swresample|ffms2|xvidcore'
-          if ($bad) { throw "genkfr.exe still needs: $bad" }
-          Write-Output "size: $((Get-Item $exe).Length) bytes"
+          dump="$(MSYS_NO_PATHCONV=1 dumpbin.exe /dependents out/genkfr.exe)"
+          echo "$dump"
+          if grep -Ei 'avcodec|avformat|avutil|swscale|swresample|ffms2|xvidcore' <<< "$dump"; then
+            echo 'genkfr.exe still needs a non-system DLL' >&2
+            exit 1
+          fi
+          echo "size: $(wc -c < out/genkfr.exe) bytes"
 
       - uses: actions/upload-artifact@v7
         with:
@@ -268,17 +220,13 @@ jobs:
           path: artifacts
 
       - name: Package
-        shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}"
-          $pkg = Join-Path $pwd "dist/genkfr-$tag-windows-x64"
-          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
-          Copy-Item artifacts/genkfr-win-x64/genkfr.exe $pkg -Force
-          Copy-Item README.md $pkg -Force
-
-          $zip = Join-Path $pwd "dist/genkfr-$tag-windows-x64.zip"
-          if (Test-Path $zip) { Remove-Item $zip -Force }
-          Compress-Archive -Path $pkg -DestinationPath $zip -Force
+          name="genkfr-$GITHUB_REF_NAME-windows-x64"
+          pkg="dist/$name"
+          mkdir -p "$pkg"
+          cp artifacts/genkfr-win-x64/genkfr.exe README.md "$pkg/"
+          rm -f "dist/$name.zip"
+          (cd dist && 7z a -tzip "$name.zip" "$name")
 
       - uses: softprops/action-gh-release@v2
         with:

@@ -1,16 +1,8 @@
 name: FFmpeg Static Libraries
 
 # Builds the static FFmpeg libraries that genkfr links, and publishes them as a
-# release asset.
-#
-# The build takes about 15 minutes, so the result is kept in a release rather
-# than in the actions cache. A release asset does not expire, and it can be
-# checked before the build starts: if the asset for this version already
-# exists, nothing is rebuilt.
-#
-# Run this by hand when a new FFmpeg version is wanted. windows-release.yml
-# only downloads the asset, it never builds FFmpeg, so a missing release makes
-# that workflow fail until you run this one.
+# release asset. Existing assets are reused rather than rebuilt.
+# windows-release.yml starts this workflow when its asset is missing.
 
 on:
   workflow_dispatch:
@@ -33,10 +25,13 @@ on:
 permissions:
   contents: write
 
+defaults:
+  run:
+    shell: bash
+
 env:
-  # A release-only triplet. vcpkg builds debug and release by default, which
-  # doubles the FFmpeg build time for libraries that are never linked.
-  VCPKG_OVERLAY_TRIPLETS: '${{ github.workspace }}\.github\triplets'
+  # Build release libraries only, with the dynamic CRT that Rust uses.
+  VCPKG_OVERLAY_TRIPLETS: '${{ github.workspace }}/.github/triplets'
   TRIPLET: 'x64-windows-static-md-release'
 
 jobs:
@@ -50,74 +45,60 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Test release asset lookup
+        run: bash .github/scripts/test-ffmpeg-asset.sh
+
       - name: Work out the release tag
         id: tag
-        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
-          $tag = "ffmpeg-libs-${{ inputs.version }}"
-          Write-Output "tag=$tag" >> $env:GITHUB_OUTPUT
-          Write-Output "asset=$tag.zip" >> $env:GITHUB_OUTPUT
-          Write-Output "Using tag $tag"
+          [[ "$VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { echo 'invalid FFmpeg version label' >&2; exit 1; }
+          tag="ffmpeg-libs-$VERSION"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "asset=$tag.zip" >> "$GITHUB_OUTPUT"
+          echo "Using tag $tag"
 
       # If the asset is already published, stop here. The caller downloads it.
       - name: Look for an existing asset
         id: existing
-        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          $tag = "${{ steps.tag.outputs.tag }}"
-          # gh writes to stderr when the release is absent, so test the exit code.
-          $found = & gh release view $tag --json assets 2>$null | ConvertFrom-Json
-          if ($LASTEXITCODE -eq 0 -and $found.assets.Count -gt 0) {
-            Write-Output "found=true" >> $env:GITHUB_OUTPUT
-            Write-Output "release $tag already holds $($found.assets.Count) asset(s), nothing to build"
-          } else {
-            Write-Output "found=false" >> $env:GITHUB_OUTPUT
-            Write-Output "release $tag does not exist yet, the libraries will be built"
-          }
+          found="$(bash .github/scripts/ffmpeg-asset.sh "$TAG")"
+          echo "found=$found" >> "$GITHUB_OUTPUT"
+          echo "release $TAG: expected asset found=$found"
 
       - name: Install static FFmpeg
         if: steps.existing.outputs.found != 'true'
-        shell: pwsh
         run: |
-          if (-not (Test-Path 'C:\vcpkg\vcpkg.exe')) { throw 'vcpkg is not at C:\vcpkg' }
+          [[ -f /c/vcpkg/vcpkg.exe ]] || { echo 'vcpkg is not at C:/vcpkg' >&2; exit 1; }
 
-          # The -md triplet links the C runtime dynamically, which is what Rust
-          # uses. A static CRT fails to link against a Rust binary.
-          #
-          # avcodec, avformat and swscale are what FFMS2 and genkfr use. avutil
-          # is always built and has no feature of its own. avdevice and avfilter
-          # are left out. zlib compresses the FFMS2 index.
-          C:\vcpkg\vcpkg.exe install "ffmpeg[avcodec,avformat,swscale,swresample,zlib]:$env:TRIPLET"
-          if ($LASTEXITCODE -ne 0) { throw 'vcpkg install failed' }
+          # avutil is always built. zlib compresses the FFMS2 index.
+          /c/vcpkg/vcpkg.exe install "ffmpeg[avcodec,avformat,swscale,swresample,zlib]:$TRIPLET"
 
       - name: Package the libraries
         if: steps.existing.outputs.found != 'true'
-        shell: pwsh
+        env:
+          ASSET: ${{ steps.tag.outputs.asset }}
         run: |
-          $installed = "C:\vcpkg\installed\$env:TRIPLET"
-          if (-not (Test-Path "$installed\lib")) { throw "no libraries at $installed\lib" }
+          installed="/c/vcpkg/installed/$TRIPLET"
+          [[ -d "$installed/lib" ]] || { echo "no libraries at $installed/lib" >&2; exit 1; }
 
-          # Only what a consumer needs: headers and libraries. The installed tree
-          # also holds share/, debug/ and the vcpkg metadata, which are not used.
-          $staging = Join-Path $env:RUNNER_TEMP 'ffmpeg-libs'
-          if (Test-Path $staging) { Remove-Item $staging -Recurse -Force }
-          New-Item -ItemType Directory -Force -Path $staging | Out-Null
-          Copy-Item "$installed\include" (Join-Path $staging 'include') -Recurse
-          Copy-Item "$installed\lib" (Join-Path $staging 'lib') -Recurse
+          # Only headers, libraries and a record of the package versions.
+          staging="$(cygpath -u "$RUNNER_TEMP")/ffmpeg-libs"
+          rm -rf "$staging"
+          mkdir -p "$staging"
+          cp -R "$installed/include" "$installed/lib" "$staging/"
+          /c/vcpkg/vcpkg.exe list > "$staging/PACKAGES.txt"
 
-          # A record of what is inside, so a consumer can tell what it got.
-          $versions = & C:\vcpkg\vcpkg.exe list 2>$null
-          $versions | Set-Content (Join-Path $staging 'PACKAGES.txt')
-
-          $zip = Join-Path $pwd "${{ steps.tag.outputs.asset }}"
-          if (Test-Path $zip) { Remove-Item $zip -Force }
-          Compress-Archive -Path "$staging\*" -DestinationPath $zip -Force
-
-          $mb = [math]::Round((Get-Item $zip).Length / 1MB, 1)
-          Write-Output "packed $zip, $mb MB"
-          if ($mb -lt 1) { throw 'the archive is suspiciously small' }
+          zip="$(pwd)/$ASSET"
+          rm -f "$zip"
+          (cd "$staging" && 7z a -tzip "$(cygpath -w "$zip")" .)
+          bytes="$(wc -c < "$zip")"
+          echo "packed $zip, $bytes bytes"
+          (( bytes >= 1048576 )) || { echo 'the archive is suspiciously small' >&2; exit 1; }
 
       - name: Publish the asset
         if: steps.existing.outputs.found != 'true'
