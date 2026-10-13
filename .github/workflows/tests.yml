@@ -1,0 +1,63 @@
+name: Tests
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  FFMPEG_VERSION: '9.0.2'
+  XVIDCORE_VERSION: '1.3.7'
+  NASM_VERSION: '2.16.03'
+
+jobs:
+  test:
+    name: Windows tests
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Test release asset lookup
+        run: bash .github/scripts/test-ffmpeg-asset.sh
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Download the FFmpeg libraries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="ffmpeg-libs-$FFMPEG_VERSION"
+          dir="$(cygpath -u "$RUNNER_TEMP")/ffmpeg"
+          mkdir -p "$dir"
+          gh release download "$tag" --pattern "$tag.zip" --dir "$dir" --clobber
+          7z x "$dir/$tag.zip" "-o$(cygpath -w "$dir")" -y
+          [[ -d "$dir/include" ]] || { echo 'the archive has no include directory' >&2; exit 1; }
+          [[ -d "$dir/lib" ]] || { echo 'the archive has no lib directory' >&2; exit 1; }
+
+      - name: Set up the MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build xvidcore
+        run: bash .github/scripts/build-xvid.sh
+
+      - name: Test genkfr
+        run: |
+          export FFMPEG_DIR="$(cygpath -m "$RUNNER_TEMP")/ffmpeg"
+          export CARGO_ENCODED_RUSTFLAGS="-L"$'\x1f'"native=$(cygpath -m "$RUNNER_TEMP")"
+          export CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER="$(cygpath -m "$VCToolsInstallDir")/bin/Hostx64/x64/link.exe"
+          cargo test --release --locked

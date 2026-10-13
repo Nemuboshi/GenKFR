@@ -45,9 +45,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Test release asset lookup
-        run: bash .github/scripts/test-ffmpeg-asset.sh
-
       - name: Work out the release tag
         id: tag
         env:
