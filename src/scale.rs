@@ -10,6 +10,7 @@
 //! region of the input that the filter reads.
 
 use anyhow::{Result, bail};
+use rayon::{ThreadPool, prelude::*};
 
 /// One axis of the filter: the source index and weight of each tap.
 struct Axis {
@@ -190,8 +191,20 @@ impl Resizer {
         })
     }
 
+    /// Exchange completed pixels with a recycled buffer instead of copying them.
+    pub fn resize_into(
+        &mut self,
+        plane: Plane<'_>,
+        pool: &ThreadPool,
+        output: &mut Vec<u8>,
+    ) -> Result<()> {
+        self.resize(plane, pool)?;
+        std::mem::swap(&mut self.output, output);
+        Ok(())
+    }
+
     /// The tightly packed result stays valid until the next resize call.
-    pub fn resize(&mut self, plane: Plane<'_>) -> Result<&[u8]> {
+    pub fn resize(&mut self, plane: Plane<'_>, pool: &ThreadPool) -> Result<&[u8]> {
         let needed = plane
             .stride
             .checked_mul(self.src_h - 1)
@@ -199,39 +212,63 @@ impl Resizer {
         if plane.stride < self.src_w || needed.is_none_or(|len| len > plane.data.len()) {
             bail!("resize input is too small for its size and stride");
         }
-        for (y, destination) in self.horizontal.chunks_exact_mut(self.dst_w).enumerate() {
-            let offset = (self.top + y) * plane.stride + self.left;
-            let source = &plane.data[offset..offset + self.active_w];
-            for (i, pixel) in destination.iter_mut().enumerate() {
-                let start = self.hx.start[i] as usize;
-                let count = self.hx.count[i] as usize;
-                let offset = self.hx.offset[i] as usize;
-                let weights = &self.hx.weights[offset..offset + count];
-                let pixels = &source[start..start + count];
-                let mut acc = 0.0f32;
-                for (&weight, &value) in weights.iter().zip(pixels) {
-                    acc += weight * f32::from(value);
-                }
-                *pixel = (acc + 0.5).floor().clamp(0.0, 255.0) as u8;
-            }
-        }
-        for (i, destination) in self.output.chunks_exact_mut(self.dst_w).enumerate() {
-            self.row.fill(0.0);
-            let start = self.vy.start[i] as usize * self.dst_w;
-            let count = self.vy.count[i] as usize;
-            let offset = self.vy.offset[i] as usize;
-            let weights = &self.vy.weights[offset..offset + count];
-            let rows = &self.horizontal[start..start + count * self.dst_w];
-            // Keep each pixel's tap order while processing contiguous rows for vectorization.
-            for (&weight, source) in weights.iter().zip(rows.chunks_exact(self.dst_w)) {
-                for (acc, &value) in self.row.iter_mut().zip(source) {
-                    *acc += weight * f32::from(value);
-                }
-            }
-            for (pixel, &acc) in destination.iter_mut().zip(&self.row) {
-                *pixel = (acc + 0.5).floor().clamp(0.0, 255.0) as u8;
-            }
-        }
+        self.output.resize(self.vy.start.len() * self.dst_w, 0);
+        let workers = pool.current_num_threads();
+        self.row.resize(workers * self.dst_w, 0.0);
+        let horizontal_chunk = (self.horizontal.len() / self.dst_w).div_ceil(workers) * self.dst_w;
+        let vertical_chunk = (self.output.len() / self.dst_w).div_ceil(workers) * self.dst_w;
+        pool.install(|| {
+            self.horizontal
+                .par_chunks_mut(horizontal_chunk)
+                .enumerate()
+                .for_each(|(group, destinations)| {
+                    let first_row = group * (horizontal_chunk / self.dst_w);
+                    for (row, destination) in destinations.chunks_exact_mut(self.dst_w).enumerate()
+                    {
+                        let offset = (self.top + first_row + row) * plane.stride + self.left;
+                        let source = &plane.data[offset..offset + self.active_w];
+                        for (i, pixel) in destination.iter_mut().enumerate() {
+                            let start = self.hx.start[i] as usize;
+                            let count = self.hx.count[i] as usize;
+                            let offset = self.hx.offset[i] as usize;
+                            let weights = &self.hx.weights[offset..offset + count];
+                            let pixels = &source[start..start + count];
+                            let mut acc = 0.0f32;
+                            for (&weight, &value) in weights.iter().zip(pixels) {
+                                acc += weight * f32::from(value);
+                            }
+                            *pixel = (acc + 0.5).floor().clamp(0.0, 255.0) as u8;
+                        }
+                    }
+                });
+            // for_each completes the horizontal pass before any vertical task reads it.
+            self.output
+                .par_chunks_mut(vertical_chunk)
+                .zip(self.row.par_chunks_mut(self.dst_w))
+                .enumerate()
+                .for_each(|(group, (destinations, scratch))| {
+                    let first_row = group * (vertical_chunk / self.dst_w);
+                    for (row, destination) in destinations.chunks_exact_mut(self.dst_w).enumerate()
+                    {
+                        scratch.fill(0.0);
+                        let i = first_row + row;
+                        let start = self.vy.start[i] as usize * self.dst_w;
+                        let count = self.vy.count[i] as usize;
+                        let offset = self.vy.offset[i] as usize;
+                        let weights = &self.vy.weights[offset..offset + count];
+                        let rows = &self.horizontal[start..start + count * self.dst_w];
+                        // Keep each pixel's tap order across contiguous source rows.
+                        for (&weight, source) in weights.iter().zip(rows.chunks_exact(self.dst_w)) {
+                            for (acc, &value) in scratch.iter_mut().zip(source) {
+                                *acc += weight * f32::from(value);
+                            }
+                        }
+                        for (pixel, &acc) in destination.iter_mut().zip(scratch.iter()) {
+                            *pixel = (acc + 0.5).floor().clamp(0.0, 255.0) as u8;
+                        }
+                    }
+                });
+        });
         Ok(&self.output)
     }
 }
@@ -257,7 +294,7 @@ mod tests {
                 horizontal[y * resizer.dst_w + x] = (acc + 0.5).floor().clamp(0.0, 255.0) as u8;
             }
         }
-        let mut output = vec![0; resizer.output.len()];
+        let mut output = vec![0; resizer.vy.start.len() * resizer.dst_w];
         for y in 0..resizer.vy.start.len() {
             for x in 0..resizer.dst_w {
                 let mut acc = 0.0f32;
@@ -274,89 +311,174 @@ mod tests {
 
     #[test]
     fn keeps_rounding_between_the_two_filter_passes() {
-        let mut resizer = Resizer::new(2, 2, 1, 1, Crop::default()).unwrap();
-        assert_eq!(
-            resizer
-                .resize(Plane {
-                    data: &[0, 40, 80, 120],
-                    stride: 2
-                })
-                .unwrap(),
-            [60]
-        );
-        // Horizontal rows round to 1 and 2, then the vertical result rounds to 2.
-        assert_eq!(
-            resizer
-                .resize(Plane {
-                    data: &[0, 1, 1, 2],
-                    stride: 2
-                })
-                .unwrap(),
-            [2]
-        );
+        for workers in [1, 2, 4, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .unwrap();
+            let mut resizer = Resizer::new(2, 2, 1, 1, Crop::default()).unwrap();
+            for (data, expected) in [([0, 40, 80, 120], 60), ([0, 1, 1, 2], 2)] {
+                // The second input rounds horizontally to 1 and 2, then vertically to 2.
+                assert_eq!(
+                    resizer
+                        .resize(
+                            Plane {
+                                data: &data,
+                                stride: 2
+                            },
+                            &pool
+                        )
+                        .unwrap(),
+                    [expected]
+                );
+            }
+        }
     }
 
     #[test]
     fn preserves_scalar_pixels_and_reuses_buffers() {
         let mut state = 42u32;
-        for (sw, sh, dw, dh, crop) in [
-            (1, 1, 3, 5, Crop::default()),
-            (5, 7, 2, 3, Crop::default()),
-            (6, 4, 11, 9, Crop::default()),
-            (65, 49, 32, 24, Crop::default()),
-            (
-                17,
-                19,
-                6,
-                4,
-                Crop {
-                    left: Some(2.25),
-                    top: Some(1.25),
-                    width: Some(11.5),
-                    height: Some(12.5),
-                },
-            ),
-        ] {
-            let mut resizer = Resizer::new(sw, sh, dw, dh, crop).unwrap();
-            let pointers = (
-                resizer.horizontal.as_ptr(),
-                resizer.output.as_ptr(),
-                resizer.row.as_ptr(),
-            );
-            for padding in [0, 7] {
-                let stride = sw as usize + padding;
-                for _ in 0..3 {
-                    let data: Vec<_> = (0..stride * (sh as usize - 1) + sw as usize)
-                        .map(|_| {
-                            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
-                            (state >> 24) as u8
-                        })
-                        .collect();
-                    let expected = reference(&resizer, &data, stride);
-                    assert_eq!(
-                        resizer
-                            .resize(Plane {
-                                data: &data,
-                                stride
+        for workers in [1, 2, 4, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .unwrap();
+            for (sw, sh, dw, dh, crop) in [
+                (1, 1, 3, 5, Crop::default()),
+                (5, 7, 2, 3, Crop::default()),
+                (6, 4, 11, 9, Crop::default()),
+                (65, 49, 32, 24, Crop::default()),
+                (960, 432, 800, 360, Crop::default()),
+                (
+                    17,
+                    19,
+                    6,
+                    4,
+                    Crop {
+                        left: Some(2.25),
+                        top: Some(1.25),
+                        width: Some(11.5),
+                        height: Some(12.5),
+                    },
+                ),
+            ] {
+                let mut resizer = Resizer::new(sw, sh, dw, dh, crop).unwrap();
+                resizer
+                    .resize(
+                        Plane {
+                            data: &vec![0; sw as usize * sh as usize],
+                            stride: sw as usize,
+                        },
+                        &pool,
+                    )
+                    .unwrap();
+                let pointers = (
+                    resizer.horizontal.as_ptr(),
+                    resizer.output.as_ptr(),
+                    resizer.row.as_ptr(),
+                );
+                for padding in [0, 7] {
+                    let stride = sw as usize + padding;
+                    for _ in 0..3 {
+                        let data: Vec<_> = (0..stride * (sh as usize - 1) + sw as usize)
+                            .map(|_| {
+                                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                                (state >> 24) as u8
                             })
-                            .unwrap(),
-                        expected
-                    );
-                    assert_eq!(
-                        pointers,
-                        (
-                            resizer.horizontal.as_ptr(),
-                            resizer.output.as_ptr(),
-                            resizer.row.as_ptr()
-                        )
-                    );
+                            .collect();
+                        let expected = reference(&resizer, &data, stride);
+                        assert_eq!(
+                            resizer
+                                .resize(
+                                    Plane {
+                                        data: &data,
+                                        stride
+                                    },
+                                    &pool
+                                )
+                                .unwrap(),
+                            expected
+                        );
+                        assert_eq!(
+                            pointers,
+                            (
+                                resizer.horizontal.as_ptr(),
+                                resizer.output.as_ptr(),
+                                resizer.row.as_ptr()
+                            )
+                        );
+                    }
                 }
             }
         }
     }
 
     #[test]
+    fn exchanges_recycled_outputs_without_changing_held_frames() {
+        for workers in [1, 4, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .unwrap();
+            let mut resizer = Resizer::new(65, 49, 32, 24, Crop::default()).unwrap();
+            let mut outputs = [Vec::new(), Vec::new(), Vec::new()];
+            let mut expected = [Vec::new(), Vec::new(), Vec::new()];
+            let mut allocations = Vec::new();
+            for number in 0..18 {
+                let data: Vec<u8> = (0..72 * 48 + 65)
+                    .map(|i| (i * 37 + number * 11) as u8)
+                    .collect();
+                let slot = number % outputs.len();
+                expected[slot] = reference(&resizer, &data, 72);
+                pool.install(|| {
+                    resizer.resize_into(
+                        Plane {
+                            data: &data,
+                            stride: 72,
+                        },
+                        &pool,
+                        &mut outputs[slot],
+                    )
+                })
+                .unwrap();
+                assert_eq!(outputs, expected);
+                if number >= 3 {
+                    let mut pointers: Vec<_> = outputs
+                        .iter()
+                        .map(|v| v.as_ptr())
+                        .chain([resizer.output.as_ptr()])
+                        .collect();
+                    pointers.sort_unstable();
+                    if number == 3 {
+                        allocations = pointers;
+                    } else {
+                        assert_eq!(pointers, allocations);
+                    }
+                }
+            }
+            let saved = outputs[0].clone();
+            assert!(
+                resizer
+                    .resize_into(
+                        Plane {
+                            data: &[],
+                            stride: 65
+                        },
+                        &pool,
+                        &mut outputs[0]
+                    )
+                    .is_err()
+            );
+            assert_eq!(outputs[0], saved);
+        }
+    }
+
+    #[test]
     fn rejects_invalid_dimensions_crops_and_planes() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
         for size in [(0, 4, 2, 2), (4, 0, 2, 2), (4, 4, 0, 2), (4, 4, 2, 0)] {
             assert!(Resizer::new(size.0, size.1, size.2, size.3, Crop::default()).is_err());
         }
@@ -390,7 +512,7 @@ mod tests {
         );
         let mut resizer = Resizer::new(4, 4, 2, 2, Crop::default()).unwrap();
         for (data, stride) in [(&[0; 16][..], 3), (&[0; 15][..], 4), (&[][..], usize::MAX)] {
-            assert!(resizer.resize(Plane { data, stride }).is_err());
+            assert!(resizer.resize(Plane { data, stride }, &pool).is_err());
         }
     }
 }

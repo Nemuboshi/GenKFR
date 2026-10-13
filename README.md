@@ -72,7 +72,15 @@ checks that the encoder object contains the thread creation call.
 
 The resizer caches filter coefficients and reuses its buffers for each video
 plane. It preserves the pixel accumulation order and the 8-bit rounding after
-each filter pass. See [performance measurements and validation](docs/performance.md).
+each filter pass. A persistent Rayon pool uses up to four workers to split each
+resize pass into groups of output rows. The horizontal pass finishes before
+the vertical pass starts, and each vertical group has its own reusable
+accumulation row. One pool dispatch processes all three planes for each frame.
+The resizers exchange completed output buffers with recycled frame buffers.
+A worker decodes and resizes upcoming frames while the
+encoder processes prepared frames in source order. Three reusable frame
+buffers bound the queue memory. Each run prints processing speed, stage times
+and queue waits. See [performance measurements and validation](docs/performance.md).
 
 The release workflow uses this script. The independent
 test workflow is `.github/workflows/tests.yml`:

@@ -10,6 +10,7 @@ resolver = "3"
 
 [dependencies]
 anyhow = "1"
+rayon = "1.11"
 genkfr-media = { path = "crates/genkfr-media" }
 
 [profile.release]
