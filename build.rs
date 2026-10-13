@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 fn main() {
     println!("cargo:rerun-if-changed=vendor/ffms2/src/core");
     println!("cargo:rerun-if-changed=vendor/ffms2/include");
+    println!("cargo:rerun-if-changed=src/ffms-layout.cpp");
     println!("cargo:rerun-if-env-changed=FFMPEG_DIR");
 
     let ffmpeg = find_ffmpeg();
@@ -36,6 +37,7 @@ fn main() {
         .include("vendor/ffms2/include")
         .include("vendor/ffms2/src/core")
         .include(&include)
+        .file("src/ffms-layout.cpp")
         .file("vendor/ffms2/src/core/audiosource.cpp")
         .file("vendor/ffms2/src/core/ffms.cpp")
         .file("vendor/ffms2/src/core/filehandle.cpp")

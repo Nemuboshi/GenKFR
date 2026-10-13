@@ -19,6 +19,7 @@
 use anyhow::{Result, anyhow, bail};
 use std::ffi::c_void;
 use std::os::raw::{c_char, c_int, c_uint};
+use std::ptr::NonNull;
 
 // ---- constants -----------------------------------------------------------
 
@@ -58,8 +59,18 @@ const MAX_KEY_INTERVAL: c_int = 10_000_000;
 const FINCR: c_int = 1;
 const FBASE: c_int = 1;
 
-/// Same value as SCXVID_BUFFER_SIZE. xvid writes the real bitstream here.
-const BUFFER_SIZE: usize = 4 * 1024 * 1024;
+/// xvid's encoder does not enforce the supplied bitstream length.
+fn buffer_size(width: c_int, height: c_int) -> Result<usize> {
+    // Six blocks with at most 64 32-bit coefficients each, plus headers/MVs.
+    let macroblocks = (width as usize)
+        .div_ceil(16)
+        .checked_mul((height as usize).div_ceil(16));
+    macroblocks
+        .and_then(|count| count.checked_mul(2048))
+        .and_then(|bytes| bytes.checked_add(4096))
+        .filter(|&bytes| bytes <= c_int::MAX as usize)
+        .ok_or_else(|| anyhow!("frame size exceeds the encoder buffer limit"))
+}
 
 // ---- structures ----------------------------------------------------------
 // Field order copied from xvid.h. A mismatch is silent memory corruption, so
@@ -167,6 +178,7 @@ unsafe extern "C" {
 /// instead of `available_parallelism`, or the output differs from the
 /// reference on the same machine.
 pub fn probe_threads() -> Result<c_int> {
+    // SAFETY below: info has the checked C layout, is writable, and is not retained.
     let mut info = XvidGblInfo {
         version: XVID_VERSION,
         actual_version: 0,
@@ -193,6 +205,7 @@ pub fn probe_threads() -> Result<c_int> {
 
 /// The version string that xvidcore reports, for bug reports.
 pub fn actual_version() -> Result<(u8, u8, u8)> {
+    // SAFETY below: info has the checked C layout, is writable, and is not retained.
     let mut info = XvidGblInfo {
         version: XVID_VERSION,
         actual_version: 0,
@@ -220,8 +233,9 @@ pub fn actual_version() -> Result<(u8, u8, u8)> {
 }
 
 pub struct Xvid {
-    handle: *mut c_void,
+    handle: NonNull<c_void>,
     buffer: Vec<u8>,
+    width: c_int,
     height: c_int,
 }
 
@@ -235,19 +249,26 @@ impl Xvid {
             bail!("xvidcore needs a positive even size, got {width}x{height}");
         }
 
-        let mut init = XvidGblInit {
-            version: XVID_VERSION,
-            cpu_flags: 0,
-            debug: 0,
-        };
-        let rc = unsafe {
-            xvid_global(
-                std::ptr::null_mut(),
-                XVID_GBL_INIT,
-                (&raw mut init).cast(),
-                std::ptr::null_mut(),
-            )
-        };
+        let buffer_size = buffer_size(width, height)?;
+        let buffer = vec![0u8; buffer_size];
+
+        static INIT: std::sync::OnceLock<c_int> = std::sync::OnceLock::new();
+        let rc = *INIT.get_or_init(|| {
+            let mut init = XvidGblInit {
+                version: XVID_VERSION,
+                cpu_flags: 0,
+                debug: 0,
+            };
+            // SAFETY: init has the checked C layout; global init runs once.
+            unsafe {
+                xvid_global(
+                    std::ptr::null_mut(),
+                    XVID_GBL_INIT,
+                    (&raw mut init).cast(),
+                    std::ptr::null_mut(),
+                )
+            }
+        });
         if rc != 0 {
             bail!("xvid_global(XVID_GBL_INIT) returned {rc}");
         }
@@ -279,6 +300,8 @@ impl Xvid {
             num_slices: num_threads,
         };
 
+        // SAFETY: checked C layout/dimensions, initialized library, no plugins
+        // or zones; the returned handle is checked and uniquely owned by Self.
         let rc = unsafe {
             xvid_encore(
                 std::ptr::null_mut(),
@@ -291,13 +314,13 @@ impl Xvid {
             // -4 is XVID_ERR_VERSION, the usual cause of a silent init failure.
             bail!("xvid_encore(XVID_ENC_CREATE) returned {rc}");
         }
-        if create.handle.is_null() {
-            bail!("xvid_encore(XVID_ENC_CREATE) returned a null handle");
-        }
+        let handle = NonNull::new(create.handle)
+            .ok_or_else(|| anyhow!("xvid_encore(XVID_ENC_CREATE) returned a null handle"))?;
 
         Ok(Self {
-            handle: create.handle,
-            buffer: vec![0u8; BUFFER_SIZE],
+            handle,
+            buffer,
+            width,
             height,
         })
     }
@@ -315,9 +338,15 @@ impl Xvid {
         y_stride: c_int,
         uv_stride: c_int,
     ) -> Result<bool> {
-        let need_y = (self.height as usize) * (y_stride as usize);
-        if y.len() < need_y {
-            bail!("luma plane too small: {} < {need_y}", y.len());
+        for (name, plane, stride, width, height) in [
+            ("Y", y, y_stride, self.width, self.height),
+            ("U", u, uv_stride, self.width / 2, self.height / 2),
+            ("V", v, uv_stride, self.width / 2, self.height / 2),
+        ] {
+            let need = crate::plane::plane_len(stride, width, height)?;
+            if plane.len() < need {
+                bail!("{name} plane too small: {} < {need}", plane.len());
+            }
         }
 
         let mut frame = XvidEncFrame {
@@ -345,7 +374,7 @@ impl Xvid {
             quant: QUANT,
             bframe_threshold: 0,
             bitstream: self.buffer.as_mut_ptr().cast(),
-            length: BUFFER_SIZE as c_int,
+            length: self.buffer.len() as c_int,
             out_flags: 0,
         };
 
@@ -365,9 +394,11 @@ impl Xvid {
             sse_v: 0,
         };
 
+        // SAFETY: validated planes cover every row; PLANAR input is copied,
+        // not modified or retained (image/image.c); buffer_size bounds output.
         let rc = unsafe {
             xvid_encore(
-                self.handle,
+                self.handle.as_ptr(),
                 XVID_ENC_ENCODE,
                 (&raw mut frame).cast(),
                 (&raw mut stats).cast(),
@@ -389,9 +420,10 @@ impl Xvid {
 
 impl Drop for Xvid {
     fn drop(&mut self) {
+        // SAFETY: this is the unique live encoder handle, destroyed once.
         unsafe {
             xvid_encore(
-                self.handle,
+                self.handle.as_ptr(),
                 XVID_ENC_DESTROY,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
@@ -400,15 +432,85 @@ impl Drop for Xvid {
     }
 }
 
-// ---- layout guards -------------------------------------------------------
-// These fail the build, not the run, if a struct drifts from xvid.h.
-
+// Mirrored by .github/scripts/xvid-layout.c against the xvid build's header.
 const _: () = {
-    assert!(std::mem::size_of::<XvidImage>() == 8 + 32 + 16);
-    assert!(std::mem::size_of::<XvidGblInit>() == 12);
-    assert!(std::mem::size_of::<XvidGblInfo>() == 8 + 8 + 8);
-    assert!(std::mem::size_of::<XvidEncStats>() == 13 * 4);
-    // 64-bit pointer, no padding surprises.
-    assert!(std::mem::size_of::<XvidEncCreate>() % 8 == 0);
-    assert!(std::mem::size_of::<XvidEncFrame>() % 8 == 0);
+    use std::mem::{align_of, offset_of, size_of};
+    assert!(
+        size_of::<usize>() == 8,
+        "FFI layouts require a 64-bit target"
+    );
+    assert!(size_of::<XvidImage>() == 56 && align_of::<XvidImage>() == 8);
+    assert!(offset_of!(XvidImage, plane) == 8 && offset_of!(XvidImage, stride) == 40);
+    assert!(size_of::<XvidGblInit>() == 12 && align_of::<XvidGblInit>() == 4);
+    assert!(size_of::<XvidGblInfo>() == 24 && align_of::<XvidGblInfo>() == 8);
+    assert!(offset_of!(XvidGblInfo, build) == 8 && offset_of!(XvidGblInfo, num_threads) == 20);
+    assert!(size_of::<XvidEncStats>() == 52 && align_of::<XvidEncStats>() == 4);
+    assert!(size_of::<XvidEncCreate>() == 128 && align_of::<XvidEncCreate>() == 8);
+    assert!(offset_of!(XvidEncCreate, zones) == 24);
+    assert!(offset_of!(XvidEncCreate, plugins) == 40);
+    assert!(offset_of!(XvidEncCreate, min_quant) == 84);
+    assert!(offset_of!(XvidEncCreate, handle) == 112);
+    assert!(offset_of!(XvidEncCreate, num_slices) == 124);
+    assert!(size_of::<XvidEncFrame>() == 136 && align_of::<XvidEncFrame>() == 8);
+    assert!(offset_of!(XvidEncFrame, quant_intra_matrix) == 8);
+    assert!(offset_of!(XvidEncFrame, input) == 48);
+    assert!(offset_of!(XvidEncFrame, type_) == 104);
+    assert!(offset_of!(XvidEncFrame, bitstream) == 120);
+    assert!(offset_of!(XvidEncFrame, out_flags) == 132);
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_invalid_planes_before_encoding() {
+        let mut encoder = Xvid::new(16, 16, 1).unwrap();
+        let y = [0; 256];
+        let uv = [128; 64];
+        for (ys, uvs) in [
+            (0, 8),
+            (-16, 8),
+            (15, 8),
+            (16, 0),
+            (16, -8),
+            (16, 7),
+            (i32::MAX, 8),
+            (16, i32::MAX),
+        ] {
+            assert!(encoder.is_keyframe(&y, &uv, &uv, ys, uvs).is_err());
+        }
+        assert!(encoder.is_keyframe(&y[..255], &uv, &uv, 16, 8).is_err());
+        assert!(encoder.is_keyframe(&y, &[], &uv, 16, 8).is_err());
+        assert!(encoder.is_keyframe(&y, &uv, &[], 16, 8).is_err());
+        assert!(encoder.is_keyframe(&y, &uv[..63], &uv, 16, 8).is_err());
+        assert!(encoder.is_keyframe(&y, &uv, &uv[..63], 16, 8).is_err());
+        assert!(encoder.is_keyframe(&y, &uv, &uv, 16, 8).unwrap());
+    }
+
+    #[test]
+    fn accepts_padded_planes() {
+        let mut encoder = Xvid::new(16, 16, 1).unwrap();
+        assert!(
+            encoder
+                .is_keyframe(&[0; 320], &[128; 80], &[128; 80], 20, 10)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_encoder_sizes() {
+        for (w, h) in [
+            (0, 16),
+            (-2, 16),
+            (16, 0),
+            (15, 16),
+            (16, 15),
+            (i32::MAX - 1, 16),
+        ] {
+            assert!(Xvid::new(w, h, 1).is_err());
+        }
+        assert!(buffer_size(i32::MAX - 1, i32::MAX - 1).is_err());
+        assert!(buffer_size(800, 360).unwrap() > 800 * 360 * 6);
+    }
+}

@@ -5,6 +5,7 @@
 //! VapourSynth and no plugin.
 
 mod decode;
+mod plane;
 mod scale;
 mod xvid;
 
@@ -93,12 +94,12 @@ fn process_input(input: &Path, crop: Crop, threads: i32) -> Result<()> {
     let resolved = canonicalize_lossy(input)?;
 
     let mut decoder = decode::Decoder::open(&resolved, threads)?;
-    let target_width = align_width_4(decoder.width, decoder.height, TARGET_HEIGHT);
+    let target_width = align_width_4(decoder.width(), decoder.height(), TARGET_HEIGHT);
 
     // The crop is in source pixels. As in VapourSynth, it selects the region
     // that the filter samples; it does not change the output size.
-    let source_w = decoder.width as u32;
-    let source_h = decoder.height as u32;
+    let source_w = decoder.width() as u32;
+    let source_h = decoder.height() as u32;
 
     let target_w = target_width;
     let mut encoder = xvid::Xvid::new(target_w, TARGET_HEIGHT, threads)?;
@@ -108,9 +109,9 @@ fn process_input(input: &Path, crop: Crop, threads: i32) -> Result<()> {
     let mut chroma_u = Vec::new();
     let mut chroma_v = Vec::new();
 
-    for number in 0..decoder.num_frames {
+    for number in 0..decoder.num_frames() {
         if number % 1000 == 0 {
-            eprintln!("processing frame {number}/{}", decoder.num_frames);
+            eprintln!("processing frame {number}/{}", decoder.num_frames());
         }
 
         let frame = decoder.frame(number)?;
@@ -159,13 +160,7 @@ fn process_input(input: &Path, crop: Crop, threads: i32) -> Result<()> {
         )?
         .clone_into(&mut chroma_v);
 
-        if encoder.is_keyframe(
-            &luma,
-            &chroma_u,
-            &chroma_v,
-            target_w,
-            target_w / 2,
-        )? {
+        if encoder.is_keyframe(&luma, &chroma_u, &chroma_v, target_w, target_w / 2)? {
             keyframes.push(number);
         }
     }
@@ -174,7 +169,7 @@ fn process_input(input: &Path, crop: Crop, threads: i32) -> Result<()> {
 
     println!("input: {}", resolved.display());
     println!("output: {}", output.display());
-    println!("frames: {}", decoder.num_frames);
+    println!("frames: {}", decoder.num_frames());
     println!("fps: {:.6}", decoder.fps());
     println!("keyframes: {}", keyframes.len());
     println!();
