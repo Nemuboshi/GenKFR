@@ -63,15 +63,21 @@ fn main() {
     // static triplet has neither `zlib.lib` nor `z.lib`. Older ports ship
     // `zlib.lib`. Ask the prefix what it has, or the link fails with LNK1181.
     let zlib = pick_zlib(&lib);
-    for name in ["avformat", "avcodec", "swscale", "swresample", "avutil", zlib] {
+    for name in [
+        "avformat",
+        "avcodec",
+        "swscale",
+        "swresample",
+        "avutil",
+        zlib,
+    ] {
         println!("cargo:rustc-link-lib=static={name}");
     }
 
     // System libraries that FFmpeg needs on Windows.
     for name in [
-        "bcrypt", "ws2_32", "secur32", "mfplat", "mfuuid", "strmiids", "ole32",
-        "user32", "crypt32", "psapi", "uuid", "oleaut32", "shlwapi", "gdi32",
-        "vfw32",
+        "bcrypt", "ncrypt", "ws2_32", "secur32", "mfplat", "mfuuid", "strmiids", "ole32", "user32",
+        "crypt32", "psapi", "uuid", "oleaut32", "shlwapi", "gdi32", "vfw32",
     ] {
         println!("cargo:rustc-link-lib={name}");
     }
@@ -100,7 +106,10 @@ fn find_ffmpeg() -> PathBuf {
         if path.join("include").is_dir() {
             return path;
         }
-        panic!("FFMPEG_DIR is set but has no include directory: {}", path.display());
+        panic!(
+            "FFMPEG_DIR is set but has no include directory: {}",
+            path.display()
+        );
     }
 
     for candidate in vcpkg_candidates() {
