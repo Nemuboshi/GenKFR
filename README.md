@@ -72,7 +72,7 @@ checks that the encoder object contains the thread creation call.
 
 The resizer caches filter coefficients and reuses its buffers for each video
 plane. It preserves the pixel accumulation order and the 8-bit rounding after
-each filter pass.
+each filter pass. See [performance measurements and validation](docs/performance.md).
 
 The release workflow uses this script. The independent
 test workflow is `.github/workflows/tests.yml`:
