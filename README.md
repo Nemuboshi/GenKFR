@@ -32,27 +32,43 @@ the size of the output.
 
 ## Build
 
-`genkfr.exe` links everything statically, so the release has no DLL files.
+The native libraries link statically into `genkfr.exe`. The program does not
+need FFmpeg, FFMS2 or xvidcore DLL files. It still needs the Microsoft Visual
+C++ runtime.
 
-FFMS2 is a git submodule in `vendor/ffms2`, pinned to a commit. `build.rs`
-compiles its core sources, because FFMS2 is normally built as a DLL and GenKFR
-links it statically. Clone with submodules:
+`crates/genkfr-media` provides the safe Rust interfaces for decoding and scene
+detection. Its native declarations stay private. bindgen generates them from
+the library headers during each build, including checks for structure layouts.
+The application rejects `unsafe` code.
+
+FFMS2 is a git submodule in `vendor/ffms2`, pinned to a commit. The binding
+package's `build.rs` compiles its core sources. Clone with submodules:
 
 ```bash
 git clone --recursive <repository>
 ```
 
-Two things must be available:
+Builds currently support Windows x64 with MSVC. Run Cargo in an MSVC developer
+environment. Set these paths to native Windows paths, such as `D:/libs/ffmpeg`:
 
-- **FFmpeg**, for its headers and static libraries. Set `FFMPEG_DIR` to the
-  prefix that holds `include/` and `lib/`. `build.rs` also looks in a vcpkg
-  tree when `VCPKG_ROOT` is set.
-- **xvidcore.lib**, from xvidcore's sources. Put it on the library path with
-  `RUSTFLAGS`.
+- `FFMPEG_DIR`: the directory with FFmpeg headers in `include/` and static
+  libraries in `lib/`. The build script also accepts a vcpkg installation
+  through `VCPKG_ROOT`.
+- `XVIDCORE_DIR`: the directory containing both `xvid.h` and the static
+  `xvidcore.lib`. Use the header from the sources that built that library.
+  The encoder currently requires xvidcore 1.3.7.
+- `LIBCLANG_PATH`: the directory containing `libclang.dll` from LLVM.
+  libclang reads the headers for bindgen. It is a build dependency, not a
+  runtime dependency.
 
 ```bash
-FFMPEG_DIR=/path/to/ffmpeg RUSTFLAGS="-L native=/path/to/xvidcore" cargo build --release
+FFMPEG_DIR=D:/libs/ffmpeg XVIDCORE_DIR=D:/libs/xvidcore LIBCLANG_PATH='C:/Program Files/LLVM/bin' cargo build --release --locked
 ```
 
-The workflow in `.github/workflows/windows-release.yml` builds both from
-source. See it for the exact flags.
+`.github/scripts/build-xvid.sh` builds xvidcore and places its header beside
+the static library. The release workflow uses this script. The independent
+test workflow is `.github/workflows/tests.yml`:
+
+```bash
+cargo test --workspace --release --locked
+```

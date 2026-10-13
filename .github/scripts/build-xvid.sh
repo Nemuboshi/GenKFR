@@ -40,9 +40,7 @@ c=(
 # Disable MSYS argument conversion so /O2 and /Fo reach MSVC unchanged.
 export MSYS_NO_PATHCONV=1
 cd "$root"
-cl.exe /nologo /std:c11 /c "/Ixvidcore/src" \
-  "/Fo$(cygpath -w "$temp/xvid-layout.obj")" \
-  "$(cygpath -w "$GITHUB_WORKSPACE/.github/scripts/xvid-layout.c")"
+cp xvidcore/src/xvid.h "$temp/xvid.h"
 for f in "${c[@]}"; do
   out="$obj/${f//\//_}"
   cl.exe /nologo /c /O2 /MD /DWIN32 /D_WINDOWS /DARCH_IS_X86_64 \

@@ -1,4 +1,4 @@
-//! Builds the vendored FFMS2 core.
+//! Builds the vendored FFMS2 core and generates private native bindings.
 //!
 //! FFMS2 is a git submodule in `vendor/ffms2`, pinned to a commit. GenKFR
 //! links it statically, so its core sources are compiled here. The submodule
@@ -13,10 +13,47 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 fn main() {
-    println!("cargo:rerun-if-changed=vendor/ffms2/src/core");
-    println!("cargo:rerun-if-changed=vendor/ffms2/include");
-    println!("cargo:rerun-if-changed=src/ffms-layout.cpp");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let ffms = root.join("vendor/ffms2");
+    println!("cargo:rerun-if-changed={}", ffms.join("src/core").display());
+    println!("cargo:rerun-if-changed={}", ffms.join("include").display());
     println!("cargo:rerun-if-env-changed=FFMPEG_DIR");
+    println!("cargo:rerun-if-env-changed=XVIDCORE_DIR");
+    println!("cargo:rerun-if-env-changed=LIBCLANG_PATH");
+
+    let target = env::var("TARGET").unwrap();
+    assert_eq!(
+        target, "x86_64-pc-windows-msvc",
+        "native builds currently support Windows x64 MSVC"
+    );
+    let xvid = PathBuf::from(
+        env::var_os("XVIDCORE_DIR")
+            .expect("set XVIDCORE_DIR to the directory containing xvid.h and xvidcore.lib"),
+    );
+    let xvid_header = xvid.join("xvid.h");
+    assert!(
+        xvid_header.is_file() && xvid.join("xvidcore.lib").is_file(),
+        "XVIDCORE_DIR must contain matching xvid.h and xvidcore.lib"
+    );
+    println!("cargo:rerun-if-changed={}", xvid_header.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        xvid.join("xvidcore.lib").display()
+    );
+
+    bindgen::Builder::default()
+        .header(ffms.join("include/ffms.h").to_str().unwrap())
+        .header(xvid_header.to_str().unwrap())
+        .clang_arg(format!("--target={target}"))
+        .clang_arg("-DFFMS_STATIC")
+        .allowlist_function("FFMS_(Init|GetPixFmt|CreateIndexer|DoIndexing2|DestroyIndex|GetFirstTrackOfType|CreateVideoSource|DestroyVideoSource|GetVideoProperties|GetFrame|SetOutputFormatV2)|xvid_(global|encore)")
+        .allowlist_type("FFMS_(ErrorInfo|Frame|VideoProperties|VideoSource|Index|Indexer)|xvid_(image|gbl_init|gbl_info|enc_create|enc_frame|enc_stats)_t")
+        .layout_tests(true)
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+        .generate()
+        .expect("cannot generate native bindings; install libclang and set LIBCLANG_PATH")
+        .write_to_file(PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("bindings.rs"))
+        .expect("cannot write generated bindings");
 
     let ffmpeg = find_ffmpeg();
     let include = ffmpeg.join("include");
@@ -34,27 +71,27 @@ fn main() {
         .define("FFMS_STATIC", None)
         .define("NDEBUG", None)
         .define("_CRT_SECURE_NO_WARNINGS", None)
-        .include("vendor/ffms2/include")
-        .include("vendor/ffms2/src/core")
-        .include(&include)
-        .file("src/ffms-layout.cpp")
-        .file("vendor/ffms2/src/core/audiosource.cpp")
-        .file("vendor/ffms2/src/core/ffms.cpp")
-        .file("vendor/ffms2/src/core/filehandle.cpp")
-        .file("vendor/ffms2/src/core/indexing.cpp")
-        .file("vendor/ffms2/src/core/track.cpp")
-        .file("vendor/ffms2/src/core/utils.cpp")
-        .file("vendor/ffms2/src/core/videosource.cpp")
-        .file("vendor/ffms2/src/core/videoutils.cpp")
-        .file("vendor/ffms2/src/core/zipfile.cpp");
-
-    if let Some(target) = env::var_os("CARGO_CFG_TARGET_ENV") {
-        if target == "msvc" {
-            build.flag_if_supported("/EHsc");
-        }
+        .include(ffms.join("include"))
+        .include(ffms.join("src/core"))
+        .include(&include);
+    for name in [
+        "audiosource",
+        "ffms",
+        "filehandle",
+        "indexing",
+        "track",
+        "utils",
+        "videosource",
+        "videoutils",
+        "zipfile",
+    ] {
+        build.file(ffms.join(format!("src/core/{name}.cpp")));
     }
+    build.flag_if_supported("/EHsc");
 
     build.compile("ffms2");
+    println!("cargo:rustc-link-search=native={}", xvid.display());
+    println!("cargo:rustc-link-lib=static=xvidcore");
 
     println!("cargo:rustc-link-search=native={}", lib.display());
 

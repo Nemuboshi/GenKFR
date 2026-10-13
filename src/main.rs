@@ -4,10 +4,11 @@
 //! decision. This program calls `xvid_encore` directly, so it needs no
 //! VapourSynth and no plugin.
 
-mod decode;
-mod plane;
+#![forbid(unsafe_code)]
+
 mod scale;
-mod xvid;
+
+use genkfr_media::{Decoder, Xvid, actual_version, probe_threads};
 
 use anyhow::{Context, Result, bail};
 use std::env;
@@ -27,8 +28,8 @@ fn main() -> Result<()> {
     }
 
     let (crop, inputs) = parse_arguments(&arguments)?;
-    let threads = xvid::probe_threads()?;
-    let (major, minor, patch) = xvid::actual_version()?;
+    let threads = probe_threads()?;
+    let (major, minor, patch) = actual_version()?;
     println!("xvidcore {major}.{minor}.{patch}");
 
     for input in inputs {
@@ -93,7 +94,7 @@ fn process_input(input: &Path, crop: Crop, threads: i32) -> Result<()> {
     let output = default_output_path(input);
     let resolved = canonicalize_lossy(input)?;
 
-    let mut decoder = decode::Decoder::open(&resolved, threads)?;
+    let mut decoder = Decoder::open(&resolved, threads)?;
     let target_width = align_width_4(decoder.width(), decoder.height(), TARGET_HEIGHT);
 
     // The crop is in source pixels. As in VapourSynth, it selects the region
@@ -102,7 +103,7 @@ fn process_input(input: &Path, crop: Crop, threads: i32) -> Result<()> {
     let source_h = decoder.height() as u32;
 
     let target_w = target_width;
-    let mut encoder = xvid::Xvid::new(target_w, TARGET_HEIGHT, threads)?;
+    let mut encoder = Xvid::new(target_w, TARGET_HEIGHT, threads)?;
     let mut keyframes: Vec<i32> = Vec::new();
 
     let mut luma = Vec::new();

@@ -2,13 +2,15 @@
 name = "genkfr"
 version = "0.1.0"
 edition = "2024"
-build = "build.rs"
+
+[workspace]
+members = ["crates/genkfr-media"]
+default-members = [".", "crates/genkfr-media"]
+resolver = "3"
 
 [dependencies]
 anyhow = "1"
-
-[build-dependencies]
-cc = "1"
+genkfr-media = { path = "crates/genkfr-media" }
 
 [profile.release]
 lto = true

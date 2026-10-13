@@ -18,7 +18,7 @@
 
 use anyhow::{Result, anyhow, bail};
 use std::ffi::c_void;
-use std::os::raw::{c_char, c_int, c_uint};
+use std::os::raw::c_int;
 use std::ptr::NonNull;
 
 // ---- constants -----------------------------------------------------------
@@ -72,103 +72,11 @@ fn buffer_size(width: c_int, height: c_int) -> Result<usize> {
         .ok_or_else(|| anyhow!("frame size exceeds the encoder buffer limit"))
 }
 
-// ---- structures ----------------------------------------------------------
-// Field order copied from xvid.h. A mismatch is silent memory corruption, so
-// the size assertions at the bottom of this file guard the layout.
-
-#[repr(C)]
-struct XvidImage {
-    csp: c_int,
-    plane: [*mut c_void; 4],
-    stride: [c_int; 4],
-}
-
-#[repr(C)]
-struct XvidGblInit {
-    version: c_int,
-    cpu_flags: c_uint,
-    debug: c_int,
-}
-
-#[repr(C)]
-struct XvidGblInfo {
-    version: c_int,
-    actual_version: c_int,
-    build: *const c_char,
-    cpu_flags: c_uint,
-    num_threads: c_int,
-}
-
-#[repr(C)]
-struct XvidEncCreate {
-    version: c_int,
-    profile: c_int,
-    width: c_int,
-    height: c_int,
-    num_zones: c_int,
-    zones: *mut c_void,
-    num_plugins: c_int,
-    plugins: *mut c_void,
-    num_threads: c_int,
-    max_bframes: c_int,
-    global: c_int,
-    fincr: c_int,
-    fbase: c_int,
-    max_key_interval: c_int,
-    frame_drop_ratio: c_int,
-    bquant_ratio: c_int,
-    bquant_offset: c_int,
-    min_quant: [c_int; 3],
-    max_quant: [c_int; 3],
-    handle: *mut c_void,
-    start_frame_num: c_int,
-    num_slices: c_int,
-}
-
-#[repr(C)]
-struct XvidEncFrame {
-    version: c_int,
-    vol_flags: c_int,
-    quant_intra_matrix: *mut u8,
-    quant_inter_matrix: *mut u8,
-    par: c_int,
-    par_width: c_int,
-    par_height: c_int,
-    fincr: c_int,
-    vop_flags: c_int,
-    motion: c_int,
-    input: XvidImage,
-    type_: c_int,
-    quant: c_int,
-    bframe_threshold: c_int,
-    bitstream: *mut c_void,
-    length: c_int,
-    out_flags: c_int,
-}
-
-#[repr(C)]
-struct XvidEncStats {
-    version: c_int,
-    type_: c_int,
-    quant: c_int,
-    vol_flags: c_int,
-    vop_flags: c_int,
-    length: c_int,
-    hlength: c_int,
-    kblks: c_int,
-    mblks: c_int,
-    ublks: c_int,
-    sse_y: c_int,
-    sse_u: c_int,
-    sse_v: c_int,
-}
-
-// xvidcore is built by the workflow and linked statically, so no DLL is needed.
-#[link(name = "xvidcore", kind = "static")]
-unsafe extern "C" {
-    fn xvid_global(handle: *mut c_void, opt: c_int, p1: *mut c_void, p2: *mut c_void) -> c_int;
-    fn xvid_encore(handle: *mut c_void, opt: c_int, p1: *mut c_void, p2: *mut c_void) -> c_int;
-}
+use crate::ffi::{
+    xvid_enc_create_t as XvidEncCreate, xvid_enc_frame_t as XvidEncFrame,
+    xvid_enc_stats_t as XvidEncStats, xvid_encore, xvid_gbl_info_t as XvidGblInfo,
+    xvid_gbl_init_t as XvidGblInit, xvid_global, xvid_image_t as XvidImage,
+};
 
 // ---- public API ----------------------------------------------------------
 
@@ -249,6 +157,10 @@ impl Xvid {
             bail!("xvidcore needs a positive even size, got {width}x{height}");
         }
 
+        let version = actual_version()?;
+        if version != (1, 3, 7) {
+            bail!("unsupported xvidcore version {version:?}; recheck the encoder buffer bound");
+        }
         let buffer_size = buffer_size(width, height)?;
         let buffer = vec![0u8; buffer_size];
 
@@ -431,33 +343,6 @@ impl Drop for Xvid {
         }
     }
 }
-
-// Mirrored by .github/scripts/xvid-layout.c against the xvid build's header.
-const _: () = {
-    use std::mem::{align_of, offset_of, size_of};
-    assert!(
-        size_of::<usize>() == 8,
-        "FFI layouts require a 64-bit target"
-    );
-    assert!(size_of::<XvidImage>() == 56 && align_of::<XvidImage>() == 8);
-    assert!(offset_of!(XvidImage, plane) == 8 && offset_of!(XvidImage, stride) == 40);
-    assert!(size_of::<XvidGblInit>() == 12 && align_of::<XvidGblInit>() == 4);
-    assert!(size_of::<XvidGblInfo>() == 24 && align_of::<XvidGblInfo>() == 8);
-    assert!(offset_of!(XvidGblInfo, build) == 8 && offset_of!(XvidGblInfo, num_threads) == 20);
-    assert!(size_of::<XvidEncStats>() == 52 && align_of::<XvidEncStats>() == 4);
-    assert!(size_of::<XvidEncCreate>() == 128 && align_of::<XvidEncCreate>() == 8);
-    assert!(offset_of!(XvidEncCreate, zones) == 24);
-    assert!(offset_of!(XvidEncCreate, plugins) == 40);
-    assert!(offset_of!(XvidEncCreate, min_quant) == 84);
-    assert!(offset_of!(XvidEncCreate, handle) == 112);
-    assert!(offset_of!(XvidEncCreate, num_slices) == 124);
-    assert!(size_of::<XvidEncFrame>() == 136 && align_of::<XvidEncFrame>() == 8);
-    assert!(offset_of!(XvidEncFrame, quant_intra_matrix) == 8);
-    assert!(offset_of!(XvidEncFrame, input) == 48);
-    assert!(offset_of!(XvidEncFrame, type_) == 104);
-    assert!(offset_of!(XvidEncFrame, bitstream) == 120);
-    assert!(offset_of!(XvidEncFrame, out_flags) == 132);
-};
 
 #[cfg(test)]
 mod tests {

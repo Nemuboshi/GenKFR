@@ -1,8 +1,6 @@
 //! Video decode through FFMS2, with no VapourSynth.
 //!
-//! Only the functions that GenKFR needs are declared. Their C layouts are
-//! checked against the vendored header by `src/ffms-layout.cpp`.
-//! No bindgen or libclang is required.
+//! Native declarations are generated from the headers by this crate's build script.
 //!
 //! The `ffms2.Source` defaults are reproduced: the first indexed video track,
 //! one decode thread per logical CPU. Normal seeking is used; see `seek_mode`.
@@ -29,114 +27,11 @@ const FFMS_IEH_IGNORE: c_int = 3;
 /// FFMS2 truncates error text to fit this buffer.
 const ERROR_BUFFER_SIZE: usize = 1024;
 
-#[repr(C)]
-struct FfmsErrorInfo {
-    error_type: c_int,
-    sub_type: c_int,
-    buffer_size: c_int,
-    buffer: *mut c_char,
-}
-
-/// The leading fields of `FFMS_Frame`. FFMS2 writes the whole structure, but
-/// only these are read. The fields after `repeat_pict` are left out.
-#[repr(C)]
-struct FfmsFrame {
-    data: [*const u8; 4],
-    linesize: [c_int; 4],
-    encoded_width: c_int,
-    encoded_height: c_int,
-    encoded_pixel_format: c_int,
-    scaled_width: c_int,
-    scaled_height: c_int,
-    converted_pixel_format: c_int,
-    key_frame: c_int,
-    repeat_pict: c_int,
-}
-
-/// The leading fields of `FFMS_VideoProperties`.
-#[repr(C)]
-struct FfmsVideoProperties {
-    fps_denominator: c_int,
-    fps_numerator: c_int,
-    rff_denominator: c_int,
-    rff_numerator: c_int,
-    num_frames: c_int,
-    sar_num: c_int,
-    sar_den: c_int,
-    crop_top: c_int,
-    crop_bottom: c_int,
-    crop_left: c_int,
-    crop_right: c_int,
-    top_field_first: c_int,
-}
-
-#[repr(C)]
-struct FfmsVideoSource {
-    _private: [u8; 0],
-}
-#[repr(C)]
-struct FfmsIndex {
-    _private: [u8; 0],
-}
-#[repr(C)]
-struct FfmsIndexer {
-    _private: [u8; 0],
-}
-
-unsafe extern "C" {
-    fn FFMS_Init(argument_count: c_int, argument_values: c_int);
-    fn FFMS_GetPixFmt(name: *const c_char) -> c_int;
-    fn FFMS_CreateIndexer(source: *const c_char, error: *mut FfmsErrorInfo) -> *mut FfmsIndexer;
-    fn FFMS_DoIndexing2(
-        indexer: *mut FfmsIndexer,
-        error_handling: c_int,
-        error: *mut FfmsErrorInfo,
-    ) -> *mut FfmsIndex;
-    fn FFMS_DestroyIndex(index: *mut FfmsIndex);
-    fn FFMS_GetFirstTrackOfType(
-        index: *mut FfmsIndex,
-        track_type: c_int,
-        error: *mut FfmsErrorInfo,
-    ) -> c_int;
-    fn FFMS_CreateVideoSource(
-        source: *const c_char,
-        track: c_int,
-        index: *mut FfmsIndex,
-        threads: c_int,
-        seek_mode: c_int,
-        error: *mut FfmsErrorInfo,
-    ) -> *mut FfmsVideoSource;
-    fn FFMS_DestroyVideoSource(source: *mut FfmsVideoSource);
-    fn FFMS_GetVideoProperties(source: *mut FfmsVideoSource) -> *const FfmsVideoProperties;
-    fn FFMS_GetFrame(
-        source: *mut FfmsVideoSource,
-        frame: c_int,
-        error: *mut FfmsErrorInfo,
-    ) -> *const FfmsFrame;
-    fn FFMS_SetOutputFormatV2(
-        source: *mut FfmsVideoSource,
-        formats: *const c_int,
-        width: c_int,
-        height: c_int,
-        resizer: c_int,
-        error: *mut FfmsErrorInfo,
-    ) -> c_int;
-}
-
-// Mirrored by src/ffms-layout.cpp, compiled against the vendored header.
-const _: () = {
-    use std::mem::{align_of, offset_of, size_of};
-    assert!(
-        size_of::<usize>() == 8,
-        "FFI layouts require a 64-bit target"
-    );
-    assert!(size_of::<FfmsErrorInfo>() == 24 && align_of::<FfmsErrorInfo>() == 8);
-    assert!(offset_of!(FfmsErrorInfo, buffer) == 16);
-    assert!(size_of::<FfmsFrame>() == 80 && align_of::<FfmsFrame>() == 8);
-    assert!(offset_of!(FfmsFrame, encoded_width) == 48);
-    assert!(offset_of!(FfmsFrame, repeat_pict) == 76);
-    assert!(size_of::<FfmsVideoProperties>() == 48 && align_of::<FfmsVideoProperties>() == 4);
-    assert!(offset_of!(FfmsVideoProperties, top_field_first) == 44);
+use crate::ffi::{
+    FFMS_CreateIndexer, FFMS_CreateVideoSource, FFMS_DestroyIndex, FFMS_DestroyVideoSource,
+    FFMS_DoIndexing2, FFMS_ErrorInfo as FfmsErrorInfo, FFMS_GetFirstTrackOfType, FFMS_GetFrame,
+    FFMS_GetPixFmt, FFMS_GetVideoProperties, FFMS_Index as FfmsIndex, FFMS_Init,
+    FFMS_SetOutputFormatV2, FFMS_VideoSource as FfmsVideoSource,
 };
 
 /// Collect error text from our own buffer, without trusting a returned pointer.
@@ -206,10 +101,10 @@ impl Decoder {
 
         let mut buffer = vec![0 as c_char; ERROR_BUFFER_SIZE];
         let mut error = FfmsErrorInfo {
-            error_type: 0,
-            sub_type: 0,
-            buffer_size: ERROR_BUFFER_SIZE as c_int,
-            buffer: buffer.as_mut_ptr(),
+            ErrorType: 0,
+            SubType: 0,
+            BufferSize: ERROR_BUFFER_SIZE as c_int,
+            Buffer: buffer.as_mut_ptr(),
         };
 
         // SAFETY: source is NUL-terminated; error points to our writable buffer.
@@ -267,9 +162,9 @@ impl Decoder {
         }
         // SAFETY: source-owned properties are aligned and valid until drop.
         let properties = unsafe { &*properties };
-        let num_frames = properties.num_frames;
-        let fps_num = properties.fps_numerator;
-        let fps_den = properties.fps_denominator;
+        let num_frames = properties.NumFrames;
+        let fps_num = properties.FPSNumerator;
+        let fps_den = properties.FPSDenominator;
         if num_frames <= 0 {
             bail!("{} reports {num_frames} frames", path.display());
         }
@@ -289,10 +184,10 @@ impl Decoder {
                 error_text(&buffer)
             );
         }
-        // SAFETY: the non-null frame prefix is source-owned and valid here.
+        // SAFETY: the non-null frame is source-owned and initialized by FFMS2.
         let first = unsafe { &*first };
-        let width = first.encoded_width;
-        let height = first.encoded_height;
+        let width = first.EncodedWidth;
+        let height = first.EncodedHeight;
         drop(probe);
 
         if width <= 0 || height <= 0 {
@@ -367,10 +262,10 @@ impl Decoder {
 
         let mut buffer = vec![0 as c_char; ERROR_BUFFER_SIZE];
         let mut error = FfmsErrorInfo {
-            error_type: 0,
-            sub_type: 0,
-            buffer_size: ERROR_BUFFER_SIZE as c_int,
-            buffer: buffer.as_mut_ptr(),
+            ErrorType: 0,
+            SubType: 0,
+            BufferSize: ERROR_BUFFER_SIZE as c_int,
+            Buffer: buffer.as_mut_ptr(),
         };
 
         // SAFETY: source is live, number is in range, and &mut self excludes
@@ -379,11 +274,11 @@ impl Decoder {
         if frame.is_null() {
             bail!("cannot read frame {number}: {}", error_text(&buffer));
         }
-        // SAFETY: FFMS_GetFrame returns an aligned, source-owned frame prefix.
+        // SAFETY: FFMS_GetFrame returns an aligned, initialized, source-owned frame.
         let frame = unsafe { &*frame };
-        if frame.scaled_width != self.width
-            || frame.scaled_height != self.height
-            || frame.converted_pixel_format != self.output_format
+        if frame.ScaledWidth != self.width
+            || frame.ScaledHeight != self.height
+            || frame.ConvertedPixelFormat != self.output_format
         {
             bail!("FFMS2 returned an unexpected frame size or pixel format");
         }
@@ -404,7 +299,7 @@ impl Decoder {
         {
             // SAFETY: OutputFrame supplies source-owned AVFrame or av_image_alloc
             // planes in yuv420p. No source call or destruction occurs during copy.
-            unsafe { copy_plane(frame.data[i], frame.linesize[i], w, h, &mut self.planes[i])? };
+            unsafe { copy_plane(frame.Data[i], frame.Linesize[i], w, h, &mut self.planes[i])? };
         }
 
         Ok(Frame {
