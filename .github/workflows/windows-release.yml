@@ -186,6 +186,8 @@ jobs:
           export FFMPEG_DIR="$(cygpath -m "$RUNNER_TEMP")/ffmpeg"
           # Cargo's unit separator preserves paths containing spaces.
           export CARGO_ENCODED_RUSTFLAGS="-L"$'\x1f'"native=$(cygpath -m "$RUNNER_TEMP")"
+          # Git Bash's link.exe is not the MSVC linker.
+          export CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER="$(cygpath -m "$VCToolsInstallDir")/bin/Hostx64/x64/link.exe"
           cargo build --release
           mkdir -p out
           cp target/release/genkfr.exe out/genkfr.exe
