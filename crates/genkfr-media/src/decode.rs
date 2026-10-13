@@ -135,9 +135,9 @@ impl Decoder {
                 error_text(&buffer)
             );
         }
-        // Probe the source dimensions before configuring yuv420p output.
-        // SAFETY: valid path/track/index and error buffer; index outlives probe.
-        let probe = unsafe {
+        // Read the source dimensions before configuring yuv420p output.
+        // SAFETY: valid path/track/index and error buffer; index outlives source.
+        let video = unsafe {
             FFMS_CreateVideoSource(
                 source.as_ptr(),
                 track,
@@ -147,7 +147,7 @@ impl Decoder {
                 &raw mut error,
             )
         };
-        let probe = VideoSource(NonNull::new(probe).with_context(|| {
+        let video = VideoSource(NonNull::new(video).with_context(|| {
             format!(
                 "cannot open video in {}: {}",
                 path.display(),
@@ -155,8 +155,8 @@ impl Decoder {
             )
         })?);
 
-        // SAFETY: probe owns a live source, with no frame reference borrowed.
-        let properties = unsafe { FFMS_GetVideoProperties(probe.0.as_ptr()) };
+        // SAFETY: video owns a live source, with no frame reference borrowed.
+        let properties = unsafe { FFMS_GetVideoProperties(video.0.as_ptr()) };
         if properties.is_null() {
             bail!("FFMS2 returned no video properties for {}", path.display());
         }
@@ -175,8 +175,8 @@ impl Decoder {
             );
         }
 
-        // SAFETY: probe is live and num_frames > 0; error buffer is writable.
-        let first = unsafe { FFMS_GetFrame(probe.0.as_ptr(), 0, &raw mut error) };
+        // SAFETY: video is live and num_frames > 0; error buffer is writable.
+        let first = unsafe { FFMS_GetFrame(video.0.as_ptr(), 0, &raw mut error) };
         if first.is_null() {
             bail!(
                 "cannot read frame 0 of {}: {}",
@@ -188,31 +188,12 @@ impl Decoder {
         let first = unsafe { &*first };
         let width = first.EncodedWidth;
         let height = first.EncodedHeight;
-        drop(probe);
 
         if width <= 0 || height <= 0 {
             bail!("invalid frame size {width}x{height} in {}", path.display());
         }
 
-        // SAFETY: checked path/track/index; index will outlive the video source.
-        let video = unsafe {
-            FFMS_CreateVideoSource(
-                source.as_ptr(),
-                track,
-                index.0.as_ptr(),
-                threads,
-                seek_mode(),
-                &raw mut error,
-            )
-        };
-        let video = VideoSource(NonNull::new(video).with_context(|| {
-            format!(
-                "cannot reopen video in {}: {}",
-                path.display(),
-                error_text(&buffer)
-            )
-        })?);
-
+        // SetOutputFormat reprocesses the decoded frame, including cached frame 0.
         // Ask FFMS2 for yuv420p at the source size. The source may be 10-bit or
         // another layout, and the encoder needs 8-bit 4:2:0. The size is left
         // alone so that the resize stays in this program.
@@ -358,6 +339,47 @@ unsafe fn copy_plane(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_cached_first_frame_and_seeks_after_output_conversion() {
+        for (format, shift) in [("420jpeg", 0), ("420p10", 2)] {
+            let path = std::env::temp_dir().join(format!(
+                "genkfr-frame-cache-{format}-{}.y4m",
+                std::process::id()
+            ));
+            let mut input = format!("YUV4MPEG2 W2 H2 F1:1 Ip A1:1 C{format}\n").into_bytes();
+            for pixels in [[16u8, 17, 18, 19, 128, 129], [20, 21, 22, 23, 130, 131]] {
+                input.extend_from_slice(b"FRAME\n");
+                for pixel in pixels {
+                    if shift == 0 {
+                        input.push(pixel);
+                    } else {
+                        input.extend_from_slice(&((pixel as u16) << shift).to_le_bytes());
+                    }
+                }
+            }
+            std::fs::write(&path, input).unwrap();
+            {
+                let mut decoder = Decoder::open(&path, 1).unwrap();
+                assert_eq!(
+                    (decoder.width(), decoder.height(), decoder.num_frames()),
+                    (2, 2, 2)
+                );
+                for number in [0, 0, 1, 0, 1] {
+                    let frame = decoder.frame(number).unwrap();
+                    let offset = number as u8 * 4;
+                    assert_eq!(
+                        frame.y,
+                        [16 + offset, 17 + offset, 18 + offset, 19 + offset]
+                    );
+                    assert_eq!(frame.u, [128 + number as u8 * 2]);
+                    assert_eq!(frame.v, [129 + number as u8 * 2]);
+                    assert_eq!((frame.y_stride, frame.uv_stride), (2, 1));
+                }
+            }
+            std::fs::remove_file(path).unwrap();
+        }
+    }
 
     #[test]
     fn opening_audio_only_input_fails_cleanly() {

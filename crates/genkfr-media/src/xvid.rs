@@ -81,13 +81,7 @@ use crate::ffi::{
 
 // ---- public API ----------------------------------------------------------
 
-/// Read the thread count that xvidcore detects.
-///
-/// SCXvid gives this value to both `num_threads` and `num_slices`. Use it
-/// instead of `available_parallelism`, or the output differs from the
-/// reference on the same machine.
-pub fn probe_threads() -> Result<c_int> {
-    // SAFETY below: info has the checked C layout, is writable, and is not retained.
+fn global_info() -> Result<XvidGblInfo> {
     let mut info = XvidGblInfo {
         version: XVID_VERSION,
         actual_version: 0,
@@ -95,6 +89,7 @@ pub fn probe_threads() -> Result<c_int> {
         cpu_flags: 0,
         num_threads: 0,
     };
+    // SAFETY: info has the checked C layout, is writable, and is not retained.
     let rc = unsafe {
         xvid_global(
             std::ptr::null_mut(),
@@ -106,6 +101,16 @@ pub fn probe_threads() -> Result<c_int> {
     if rc != 0 {
         bail!("xvid_global(XVID_GBL_INFO) returned {rc}");
     }
+    Ok(info)
+}
+
+/// Read the thread count that xvidcore detects.
+///
+/// SCXvid gives this value to both `num_threads` and `num_slices`. Use it
+/// instead of `available_parallelism`, or the output differs from the
+/// reference on the same machine.
+pub fn probe_threads() -> Result<c_int> {
+    let info = global_info()?;
     if info.num_threads <= 0 {
         bail!("xvidcore reported {} threads", info.num_threads);
     }
@@ -114,26 +119,7 @@ pub fn probe_threads() -> Result<c_int> {
 
 /// The version string that xvidcore reports, for bug reports.
 pub fn actual_version() -> Result<(u8, u8, u8)> {
-    // SAFETY below: info has the checked C layout, is writable, and is not retained.
-    let mut info = XvidGblInfo {
-        version: XVID_VERSION,
-        actual_version: 0,
-        build: std::ptr::null(),
-        cpu_flags: 0,
-        num_threads: 0,
-    };
-    let rc = unsafe {
-        xvid_global(
-            std::ptr::null_mut(),
-            XVID_GBL_INFO,
-            (&raw mut info).cast(),
-            std::ptr::null_mut(),
-        )
-    };
-    if rc != 0 {
-        bail!("xvid_global(XVID_GBL_INFO) returned {rc}");
-    }
-    let v = info.actual_version;
+    let v = global_info()?.actual_version;
     Ok((
         ((v >> 16) & 0xff) as u8,
         ((v >> 8) & 0xff) as u8,
