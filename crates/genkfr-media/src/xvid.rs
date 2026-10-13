@@ -61,7 +61,8 @@ const FBASE: c_int = 1;
 
 /// xvid's encoder does not enforce the supplied bitstream length.
 fn buffer_size(width: c_int, height: c_int) -> Result<usize> {
-    // Six blocks with at most 64 32-bit coefficients each, plus headers/MVs.
+    // Derivation and supported encoder settings: docs/native-memory-safety.md.
+    // Both terms are multiples of four, so Vec<u32> holds exactly this many bytes.
     let macroblocks = (width as usize)
         .div_ceil(16)
         .checked_mul((height as usize).div_ceil(16));
@@ -142,7 +143,7 @@ pub fn actual_version() -> Result<(u8, u8, u8)> {
 
 pub struct Xvid {
     handle: NonNull<c_void>,
-    buffer: Vec<u8>,
+    buffer: Vec<u32>,
     width: c_int,
     height: c_int,
 }
@@ -162,13 +163,15 @@ impl Xvid {
             bail!("unsupported xvidcore version {version:?}; recheck the encoder buffer bound");
         }
         let buffer_size = buffer_size(width, height)?;
-        let buffer = vec![0u8; buffer_size];
+        // BitstreamInit rounds down to a uint32_t boundary and reads two words.
+        let buffer = vec![0u32; buffer_size / std::mem::size_of::<u32>()];
 
         static INIT: std::sync::OnceLock<c_int> = std::sync::OnceLock::new();
         let rc = *INIT.get_or_init(|| {
             let mut init = XvidGblInit {
                 version: XVID_VERSION,
-                cpu_flags: 0,
+                // XVID_CPU_FORCE with no feature bits selects instrumented C paths.
+                cpu_flags: if cfg!(native_asan) { 1u32 << 31 } else { 0 },
                 debug: 0,
             };
             // SAFETY: init has the checked C layout; global init runs once.
@@ -286,7 +289,7 @@ impl Xvid {
             quant: QUANT,
             bframe_threshold: 0,
             bitstream: self.buffer.as_mut_ptr().cast(),
-            length: self.buffer.len() as c_int,
+            length: (self.buffer.len() * std::mem::size_of::<u32>()) as c_int,
             out_flags: 0,
         };
 
@@ -306,8 +309,10 @@ impl Xvid {
             sse_v: 0,
         };
 
-        // SAFETY: validated planes cover every row; PLANAR input is copied,
-        // not modified or retained (image/image.c); buffer_size bounds output.
+        // SAFETY: validated planes cover every row; PLANAR pixels are copied
+        // before this call returns (image/image.c) and are not read afterwards.
+        // The initialized, word-aligned output has the capacity derived in
+        // docs/native-memory-safety.md.
         let rc = unsafe {
             xvid_encore(
                 self.handle.as_ptr(),
@@ -381,6 +386,87 @@ mod tests {
                 .is_keyframe(&[0; 320], &[128; 80], &[128; 80], 20, 10)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn buffer_capacity_is_word_aligned_and_bounded() {
+        for (w, h, bytes) in [
+            (2, 2, 6144),
+            (16, 16, 6144),
+            (18, 16, 8192),
+            (18, 18, 12288),
+            (800, 360, 2359296),
+        ] {
+            assert_eq!(buffer_size(w, h).unwrap(), bytes);
+            assert_eq!(bytes % std::mem::size_of::<u32>(), 0);
+        }
+        let max_blocks = (c_int::MAX as usize - 4096) / 2048;
+        assert!(buffer_size(max_blocks as i32 * 16, 16).is_ok());
+        assert!(buffer_size((max_blocks as i32 + 1) * 16, 16).is_err());
+        let encoder = Xvid::new(2, 2, 1).unwrap();
+        assert_eq!(
+            encoder
+                .buffer
+                .as_ptr()
+                .align_offset(std::mem::align_of::<u32>()),
+            0
+        );
+        assert_eq!(encoder.buffer.len() * std::mem::size_of::<u32>(), 6144);
+    }
+
+    fn noise(stride: usize, height: usize, state: &mut u32) -> Vec<u8> {
+        (0..stride * height)
+            .map(|_| {
+                *state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                (*state >> 24) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn encodes_noise_at_block_boundaries_and_with_different_strides() {
+        let mut state = 42;
+        for (w, h, threads) in [
+            (2, 2, 1),
+            (14, 18, 1),
+            (16, 16, 1),
+            (18, 34, 2),
+            (30, 30, 2),
+            (32, 32, 4),
+            (34, 18, 4),
+            (66, 50, 2),
+            (258, 130, 4),
+        ] {
+            let mut encoder = Xvid::new(w, h, threads).unwrap();
+            for padding in [0, 1, 7] {
+                let ys = w + padding;
+                let uvs = w / 2 + padding;
+                for _ in 0..4 {
+                    let y = noise(ys as usize, h as usize, &mut state);
+                    let u = noise(uvs as usize, h as usize / 2, &mut state);
+                    let v = noise(uvs as usize, h as usize / 2, &mut state);
+                    encoder.buffer.fill(0xa5a5a5a5);
+                    encoder.is_keyframe(&y, &u, &v, ys, uvs).unwrap();
+                    // This checks reserved tail writes, not reads or overruns past the allocation.
+                    assert!(
+                        encoder.buffer[encoder.buffer.len() - 16..]
+                            .iter()
+                            .all(|&word| word == 0xa5a5a5a5)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn encodes_identical_frames_as_p_frames() {
+        let mut encoder = Xvid::new(32, 32, 2).unwrap();
+        let y = [0; 1024];
+        let uv = [128; 256];
+        assert!(encoder.is_keyframe(&y, &uv, &uv, 32, 16).unwrap());
+        for _ in 0..8 {
+            assert!(!encoder.is_keyframe(&y, &uv, &uv, 32, 16).unwrap());
+        }
     }
 
     #[test]

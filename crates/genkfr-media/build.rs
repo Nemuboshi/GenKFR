@@ -20,26 +20,32 @@ fn main() {
     println!("cargo:rerun-if-env-changed=FFMPEG_DIR");
     println!("cargo:rerun-if-env-changed=XVIDCORE_DIR");
     println!("cargo:rerun-if-env-changed=LIBCLANG_PATH");
+    println!("cargo:rerun-if-env-changed=GENKFR_ASAN");
+    println!("cargo:rustc-check-cfg=cfg(native_asan)");
 
     let target = env::var("TARGET").unwrap();
-    assert_eq!(
-        target, "x86_64-pc-windows-msvc",
-        "native builds currently support Windows x64 MSVC"
+    let native_asan = env::var("GENKFR_ASAN").as_deref() == Ok("1");
+    let windows = target == "x86_64-pc-windows-msvc";
+    assert!(
+        windows || (target == "x86_64-unknown-linux-gnu" && native_asan),
+        "native builds support Windows x64 MSVC, or Linux x64 for ASan tests"
     );
     let xvid = PathBuf::from(
         env::var_os("XVIDCORE_DIR")
-            .expect("set XVIDCORE_DIR to the directory containing xvid.h and xvidcore.lib"),
+            .expect("set XVIDCORE_DIR to the directory containing xvid.h and the static library"),
     );
     let xvid_header = xvid.join("xvid.h");
+    let xvid_library = xvid.join(if windows {
+        "xvidcore.lib"
+    } else {
+        "libxvidcore.a"
+    });
     assert!(
-        xvid_header.is_file() && xvid.join("xvidcore.lib").is_file(),
-        "XVIDCORE_DIR must contain matching xvid.h and xvidcore.lib"
+        xvid_header.is_file() && xvid_library.is_file(),
+        "XVIDCORE_DIR must contain matching xvid.h and the static xvidcore library"
     );
     println!("cargo:rerun-if-changed={}", xvid_header.display());
-    println!(
-        "cargo:rerun-if-changed={}",
-        xvid.join("xvidcore.lib").display()
-    );
+    println!("cargo:rerun-if-changed={}", xvid_library.display());
 
     bindgen::Builder::default()
         .header(ffms.join("include/ffms.h").to_str().unwrap())
@@ -87,7 +93,20 @@ fn main() {
     ] {
         build.file(ffms.join(format!("src/core/{name}.cpp")));
     }
-    build.flag_if_supported("/EHsc");
+    if windows {
+        build.flag_if_supported("/EHsc");
+    }
+    if native_asan {
+        if windows {
+            build.flag("/fsanitize=address");
+        } else {
+            build
+                .flag("-fsanitize=address")
+                .flag("-fno-omit-frame-pointer");
+        }
+        build.debug(true);
+        println!("cargo:rustc-cfg=native_asan");
+    }
 
     build.compile("ffms2");
     println!("cargo:rustc-link-search=native={}", xvid.display());
@@ -101,7 +120,7 @@ fn main() {
     // static library is `zs.lib` and `z.lib` is the DLL import library, so a
     // static triplet has neither `zlib.lib` nor `z.lib`. Older ports ship
     // `zlib.lib`. Ask the prefix what it has, or the link fails with LNK1181.
-    let zlib = pick_zlib(&lib);
+    let zlib = if windows { pick_zlib(&lib) } else { "z" };
     for name in [
         "avformat",
         "avcodec",
@@ -111,6 +130,13 @@ fn main() {
         zlib,
     ] {
         println!("cargo:rustc-link-lib=static={name}");
+    }
+
+    if !windows {
+        for name in ["m", "pthread", "dl"] {
+            println!("cargo:rustc-link-lib={name}");
+        }
+        return;
     }
 
     // System libraries that FFmpeg needs on Windows.

@@ -3,14 +3,16 @@ set -euo pipefail
 
 # Run after MSVC setup; versions are set by the calling workflow.
 temp="$(cygpath -u "$RUNNER_TEMP")"
-zip="$temp/nasm.zip"
-dir="$temp/nasm"
-url="https://www.nasm.us/pub/nasm/releasebuilds/$NASM_VERSION/win64/nasm-$NASM_VERSION-win64.zip"
-curl --fail --location --retry 3 --output "$zip" "$url"
-7z x "$zip" "-o$(cygpath -w "$dir")" -y
-NASM="$dir/nasm-$NASM_VERSION/nasm.exe"
-[[ -f "$NASM" ]] || { echo 'nasm.exe is missing' >&2; exit 1; }
-"$NASM" -v
+if [[ "${GENKFR_ASAN:-0}" != 1 && -z "${NASM:-}" ]]; then
+  zip="$temp/nasm.zip"
+  dir="$temp/nasm"
+  url="https://www.nasm.us/pub/nasm/releasebuilds/$NASM_VERSION/win64/nasm-$NASM_VERSION-win64.zip"
+  curl --fail --location --retry 3 --output "$zip" "$url"
+  7z x "$zip" "-o$(cygpath -w "$dir")" -y
+  NASM="$dir/nasm-$NASM_VERSION/nasm.exe"
+  [[ -f "$NASM" ]] || { echo 'nasm.exe is missing' >&2; exit 1; }
+  "$NASM" -v
+fi
 
 root="$temp/xvidcore"
 tag="release-${XVIDCORE_VERSION//./_}"
@@ -41,10 +43,18 @@ c=(
 export MSYS_NO_PATHCONV=1
 cd "$root"
 cp xvidcore/src/xvid.h "$temp/xvid.h"
+flags=(/nologo /c /O2 /MD /DWIN32 /D_WINDOWS /DARCH_IS_64BIT /D_CRT_SECURE_NO_WARNINGS /DNDEBUG)
+if [[ "${GENKFR_ASAN:-0}" == 1 ]]; then
+  # Compile out assembly dispatch and CPU detection, rather than only forcing C at runtime.
+  flags+=(/DARCH_IS_GENERIC /fsanitize=address /Z7)
+  # xvid 1.3.7 otherwise selects 32-bit MSVC inline assembly for this generic helper.
+  sed -i 's/#if !defined(_MSC_VER) || defined(ARCH_IS_X86_64)/#if !defined(_MSC_VER) || defined(ARCH_IS_X86_64) || defined(ARCH_IS_GENERIC)/' xvidcore/src/motion/gmc.c
+else
+  flags+=(/DARCH_IS_X86_64)
+fi
 for f in "${c[@]}"; do
   out="$obj/${f//\//_}"
-  cl.exe /nologo /c /O2 /MD /DWIN32 /D_WINDOWS /DARCH_IS_X86_64 \
-    /DARCH_IS_64BIT /D_CRT_SECURE_NO_WARNINGS /DNDEBUG \
+  cl.exe "${flags[@]}" \
     "/Fo$(cygpath -w "${out%.c}.obj")" "$(cygpath -w "xvidcore/src/$f")"
 done
 
@@ -70,6 +80,9 @@ asm=(
   utils/x86_asm/interlacing_mmx.asm utils/x86_asm/cpuid.asm
   plugins/x86_asm/plugin_ssim-a.asm
 )
+if [[ "${GENKFR_ASAN:-0}" == 1 ]]; then
+  asm=()
+fi
 for f in "${asm[@]}"; do
   src="xvidcore/src/$f"
   out="$obj/${f//\//_}"
@@ -79,7 +92,11 @@ for f in "${asm[@]}"; do
     "$(cygpath -w "$src")" -o "$(cygpath -w "${out%.asm}.obj")"
 done
 
+# Name only this build's objects so a previous SIMD build cannot add uninstrumented code.
 objects=()
-for f in "$obj"/*.obj; do objects+=("$(cygpath -w "$f")"); done
+for f in "${c[@]}" "${asm[@]}"; do
+  out="$obj/${f//\//_}"
+  objects+=("$(cygpath -w "${out%.*}.obj")")
+done
 lib.exe /nologo "/OUT:$(cygpath -w "$temp/xvidcore.lib")" "${objects[@]}"
 echo 'xvidcore.lib built'

@@ -417,6 +417,18 @@ mod tests {
     }
 
     #[test]
+    fn copies_only_initialized_pixels() {
+        let mut source = [std::mem::MaybeUninit::<u8>::uninit(); 8];
+        for (i, pixel) in [(0, 1), (1, 2), (2, 3), (5, 4), (6, 5), (7, 6)] {
+            source[i].write(pixel);
+        }
+        let mut output = Vec::new();
+        // SAFETY: the two three-byte rows are initialized. Padding is deliberately not initialized.
+        unsafe { copy_plane(source.as_ptr().cast(), 5, 3, 2, &mut output).unwrap() };
+        assert_eq!(output, [1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
     fn rejects_invalid_planes_before_dereferencing() {
         let mut output = Vec::new();
         for (stride, width, height) in [

@@ -20,6 +20,61 @@ env:
   LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
 
 jobs:
+  asan:
+    name: Rust and native ASan (C paths)
+    runs-on: ubuntu-24.04
+    env:
+      LIBCLANG_PATH: '/usr/lib/llvm-18/lib'
+      GENKFR_ASAN: '1'
+      ZLIB_VERSION: '1.3.2'
+      CC: clang
+      CXX: clang++
+      RUSTFLAGS: '-Zsanitizer=address -Zexternal-clangrt -C linker=clang++ -C link-arg=-fsanitize=address -C force-frame-pointers=yes'
+      RUSTDOCFLAGS: '-Zsanitizer=address -Zexternal-clangrt -C linker=clang++ -C link-arg=-fsanitize=address'
+      ASAN_OPTIONS: 'detect_leaks=1:detect_stack_use_after_return=1:strict_string_checks=1:exitcode=86'
+      CARGO_TARGET_DIR: '${{ github.workspace }}/target/asan-linux'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: nightly
+          components: rust-src
+          rustflags: '${{ env.RUSTFLAGS }}'
+
+      - name: Install build and fixture tools
+        run: sudo apt-get update && sudo apt-get install -y clang llvm libclang-dev autoconf automake libtool pkg-config ffmpeg
+
+      - name: Verify Rust and native ASan detection
+        run: bash .github/scripts/test-asan-runtime.sh
+
+      - name: Build instrumented media libraries without assembly
+        run: bash .github/scripts/build-asan-libs.sh
+
+      - name: Test instrumented Rust, standard library and native libraries
+        run: |
+          export FFMPEG_DIR="$RUNNER_TEMP/asan-prefix"
+          export XVIDCORE_DIR="$FFMPEG_DIR/lib"
+          cp "$FFMPEG_DIR/include/xvid.h" "$XVIDCORE_DIR/"
+          cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu --workspace --release --locked
+          cargo +nightly build -Zbuild-std --target x86_64-unknown-linux-gnu --release --locked
+          export GENKFR_ASAN_BIN="$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/genkfr"
+          bash .github/scripts/test-asan-media.sh
+
+      - name: Save sanitizer logs and native configuration
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: asan-diagnostics
+          path: |
+            ${{ runner.temp }}/asan-runtime/*.log
+            ${{ runner.temp }}/asan-corpus/*.log
+            ${{ runner.temp }}/asan-prefix/xvid-platform.inc
+            ${{ runner.temp }}/asan-prefix/config.h
+            ${{ runner.temp }}/asan-prefix/config.mak
+
   test:
     name: Windows tests
     runs-on: windows-latest
